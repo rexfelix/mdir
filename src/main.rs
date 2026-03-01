@@ -1,6 +1,7 @@
 mod app;
 mod event;
 mod file_entry;
+mod file_ops;
 mod ui;
 
 use app::App;
@@ -42,7 +43,7 @@ fn main() -> io::Result<()> {
             ui::render(frame, &app);
         })?;
 
-        match event::poll_event(Duration::from_millis(100))? {
+        match event::poll_event_with_mode(Duration::from_millis(100), app.input_mode())? {
             event::AppEvent::Key(action) => {
                 app.handle_key(action);
             }

@@ -1,4 +1,4 @@
-use crate::app::App;
+use crate::app::{App, AppMode};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -26,11 +26,20 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     render_file_list(frame, app, chunks[0]);
     render_status_bar(frame, app, chunks[1]);
-    render_info_bar(frame, app, chunks[2]);
+
+    match &app.mode {
+        AppMode::Normal => render_info_bar(frame, app, chunks[2]),
+        AppMode::Input { prompt, buffer, cursor_pos, .. } => {
+            render_input_bar(frame, prompt, buffer, *cursor_pos, chunks[2]);
+        }
+        AppMode::Confirm { message } => {
+            render_confirm_bar(frame, message, chunks[2]);
+        }
+    }
 }
 
 fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
-    let inner_height = area.height.saturating_sub(2) as usize; // 블록 테두리 감안
+    let inner_height = area.height.saturating_sub(2) as usize;
     if inner_height == 0 || app.entries.is_empty() {
         let block = Block::default()
             .title(truncate_path(&app.current_dir.to_string_lossy(), area.width as usize - 2))
@@ -55,7 +64,6 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
         .constraints(col_constraints)
         .split(inner);
 
-    // 스크롤 계산: 현재 커서가 보이는 페이지 결정
     let total_visible = rows_per_col * app.columns;
     let page = app.cursor / total_visible;
     let page_start = page * total_visible;
@@ -73,13 +81,18 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
 
             let entry = &app.entries[idx];
             let col_width = col_areas[col].width as usize;
+            let is_selected = app.selected_indices.contains(&idx);
 
-            let name_display = format_entry_name(entry, col_width);
+            let name_display = format_entry_name(entry, col_width, is_selected);
 
             let style = if idx == app.cursor {
                 Style::default()
                     .bg(Color::White)
                     .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_selected {
+                Style::default()
+                    .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
             } else if entry.is_dir() {
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
@@ -96,15 +109,22 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let info = if let Some(entry) = app.selected_entry() {
-        format!(
-            " {} │ {} │ {}",
-            entry.name,
-            entry.display_size(),
-            entry.display_date()
-        )
+    let selected_info = if app.selected_count() > 0 {
+        format!(" [{}개 선택]", app.selected_count())
     } else {
         String::new()
+    };
+
+    let info = if let Some(entry) = app.selected_entry() {
+        format!(
+            " {} │ {} │ {}{}",
+            entry.name,
+            entry.display_size(),
+            entry.display_date(),
+            selected_info
+        )
+    } else {
+        selected_info
     };
 
     let bar = Paragraph::new(Line::from(info))
@@ -117,7 +137,7 @@ fn render_info_bar(frame: &mut Frame, app: &App, area: Rect) {
         format!(" ⚠ {}", err)
     } else {
         format!(
-            " 디렉토리: {} │ 파일: {} │ H:숨김토글 Q:종료",
+            " 디렉토리: {} │ 파일: {} │ Space:선택 C:복사 M:이동 D:삭제 R:이름변경 K:새폴더 Q:종료",
             app.dir_count(),
             app.file_count()
         )
@@ -133,10 +153,45 @@ fn render_info_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(bar, area);
 }
 
-fn format_entry_name(entry: &crate::file_entry::FileEntry, max_width: usize) -> String {
+fn render_input_bar(frame: &mut Frame, prompt: &str, buffer: &str, cursor_pos: usize, area: Rect) {
+    let prefix = format!(" {} ", prompt);
+    let before = &buffer[..cursor_pos];
+    let cursor_char = if cursor_pos < buffer.len() {
+        &buffer[cursor_pos..cursor_pos + 1]
+    } else {
+        " "
+    };
+    let after = if cursor_pos < buffer.len() {
+        &buffer[cursor_pos + 1..]
+    } else {
+        ""
+    };
+
+    let base_style = Style::default().bg(Color::Blue).fg(Color::White);
+    let cursor_style = Style::default().bg(Color::White).fg(Color::Black);
+
+    let line = Line::from(vec![
+        Span::styled(prefix, base_style),
+        Span::styled(before.to_string(), base_style),
+        Span::styled(cursor_char.to_string(), cursor_style),
+        Span::styled(after.to_string(), base_style),
+    ]);
+    let bar = Paragraph::new(line).style(base_style);
+    frame.render_widget(bar, area);
+}
+
+fn render_confirm_bar(frame: &mut Frame, message: &str, area: Rect) {
+    let text = format!(" {}", message);
+    let bar = Paragraph::new(Line::from(text))
+        .style(Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD));
+    frame.render_widget(bar, area);
+}
+
+fn format_entry_name(entry: &crate::file_entry::FileEntry, max_width: usize, selected: bool) -> String {
     let size_str = entry.display_size();
     let size_col = 8;
-    let name_max = max_width.saturating_sub(size_col + 1);
+    let marker = if selected { "*" } else { " " };
+    let name_max = max_width.saturating_sub(size_col + 2); // +2 for marker + space
 
     let name = if entry.is_parent {
         "..".to_string()
@@ -150,7 +205,7 @@ fn format_entry_name(entry: &crate::file_entry::FileEntry, max_width: usize) -> 
         name.clone()
     };
 
-    format!("{:<width$} {:>size_w$}", truncated, size_str, width = name_max, size_w = size_col)
+    format!("{}{:<width$} {:>size_w$}", marker, truncated, size_str, width = name_max, size_w = size_col)
 }
 
 fn truncate_path(path: &str, max_len: usize) -> String {
@@ -178,7 +233,7 @@ mod tests {
         let long_path = "/very/long/path/that/exceeds/the/maximum/width/limit";
         let result = truncate_path(long_path, 20);
         assert!(result.contains("..."));
-        assert!(result.len() <= 24); // 약간의 패딩 포함
+        assert!(result.len() <= 24);
     }
 
     #[test]
@@ -194,9 +249,27 @@ mod tests {
             modified: None,
             is_parent: false,
         };
-        let formatted = format_entry_name(&entry, 30);
+        let formatted = format_entry_name(&entry, 30, false);
         assert!(formatted.contains("test.txt"));
         assert!(formatted.contains("1K"));
+        assert!(formatted.starts_with(' ')); // 비선택 마커
+    }
+
+    #[test]
+    fn test_format_entry_name_selected() {
+        use crate::file_entry::{EntryType, FileEntry};
+        use std::path::PathBuf;
+
+        let entry = FileEntry {
+            name: "test.txt".to_string(),
+            path: PathBuf::from("test.txt"),
+            entry_type: EntryType::File,
+            size: 1024,
+            modified: None,
+            is_parent: false,
+        };
+        let formatted = format_entry_name(&entry, 30, true);
+        assert!(formatted.starts_with('*')); // 선택 마커
     }
 
     #[test]
@@ -212,7 +285,7 @@ mod tests {
             modified: None,
             is_parent: false,
         };
-        let formatted = format_entry_name(&entry, 25);
+        let formatted = format_entry_name(&entry, 25, false);
         assert!(formatted.contains("..."));
     }
 }

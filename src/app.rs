@@ -1,6 +1,30 @@
 use crate::event::KeyAction;
 use crate::file_entry::{self, FileEntry};
+use crate::file_ops;
+use std::collections::HashSet;
 use std::path::PathBuf;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputPurpose {
+    Copy,
+    Move,
+    Rename,
+    Mkdir,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppMode {
+    Normal,
+    Input {
+        purpose: InputPurpose,
+        buffer: String,
+        prompt: String,
+        cursor_pos: usize,
+    },
+    Confirm {
+        message: String,
+    },
+}
 
 pub struct App {
     pub current_dir: PathBuf,
@@ -14,6 +38,8 @@ pub struct App {
     pub show_hidden: bool,
     pub should_quit: bool,
     pub error_message: Option<String>,
+    pub mode: AppMode,
+    pub selected_indices: HashSet<usize>,
     previous_dir: Option<String>,
 }
 
@@ -31,6 +57,8 @@ impl App {
             show_hidden: false,
             should_quit: false,
             error_message: None,
+            mode: AppMode::Normal,
+            selected_indices: HashSet::new(),
             previous_dir: None,
         };
         app.load_directory();
@@ -65,7 +93,6 @@ impl App {
         self.terminal_width = width;
         self.terminal_height = height;
         self.columns = calculate_columns(width);
-        // 상태바 2줄 차감
         let available_height = height.saturating_sub(3) as usize;
         self.rows_per_col = if available_height == 0 {
             1
@@ -75,7 +102,23 @@ impl App {
         self.clamp_cursor();
     }
 
+    pub fn input_mode(&self) -> crate::event::InputMode {
+        match &self.mode {
+            AppMode::Normal => crate::event::InputMode::Normal,
+            AppMode::Input { .. } => crate::event::InputMode::Input,
+            AppMode::Confirm { .. } => crate::event::InputMode::Confirm,
+        }
+    }
+
     pub fn handle_key(&mut self, action: KeyAction) {
+        match &self.mode {
+            AppMode::Normal => self.handle_normal_key(action),
+            AppMode::Input { .. } => self.handle_input_key(action),
+            AppMode::Confirm { .. } => self.handle_confirm_key(action),
+        }
+    }
+
+    fn handle_normal_key(&mut self, action: KeyAction) {
         self.error_message = None;
         match action {
             KeyAction::MoveUp => self.move_up(),
@@ -89,10 +132,87 @@ impl App {
             KeyAction::Enter => self.enter(),
             KeyAction::Backspace => self.go_parent(),
             KeyAction::ToggleHidden => self.toggle_hidden(),
+            KeyAction::Select => self.toggle_select(),
+            KeyAction::Copy => self.start_copy(),
+            KeyAction::Move => self.start_move(),
+            KeyAction::Delete => self.start_delete(),
+            KeyAction::Rename => self.start_rename(),
+            KeyAction::Mkdir => self.start_mkdir(),
             KeyAction::Quit => self.should_quit = true,
             KeyAction::Noop => {}
+            // 입력/확인 모드 키는 Normal에서 무시
+            _ => {}
         }
     }
+
+    fn handle_input_key(&mut self, action: KeyAction) {
+        match action {
+            KeyAction::InputChar(c) => {
+                if let AppMode::Input { buffer, cursor_pos, .. } = &mut self.mode {
+                    buffer.insert(*cursor_pos, c);
+                    *cursor_pos += 1;
+                }
+            }
+            KeyAction::InputBackspace => {
+                if let AppMode::Input { buffer, cursor_pos, .. } = &mut self.mode {
+                    if *cursor_pos > 0 {
+                        buffer.remove(*cursor_pos - 1);
+                        *cursor_pos -= 1;
+                    }
+                }
+            }
+            KeyAction::InputDelete => {
+                if let AppMode::Input { buffer, cursor_pos, .. } = &mut self.mode {
+                    if *cursor_pos < buffer.len() {
+                        buffer.remove(*cursor_pos);
+                    }
+                }
+            }
+            KeyAction::InputCursorLeft => {
+                if let AppMode::Input { cursor_pos, .. } = &mut self.mode {
+                    if *cursor_pos > 0 {
+                        *cursor_pos -= 1;
+                    }
+                }
+            }
+            KeyAction::InputCursorRight => {
+                if let AppMode::Input { buffer, cursor_pos, .. } = &mut self.mode {
+                    if *cursor_pos < buffer.len() {
+                        *cursor_pos += 1;
+                    }
+                }
+            }
+            KeyAction::InputCursorHome => {
+                if let AppMode::Input { cursor_pos, .. } = &mut self.mode {
+                    *cursor_pos = 0;
+                }
+            }
+            KeyAction::InputCursorEnd => {
+                if let AppMode::Input { buffer, cursor_pos, .. } = &mut self.mode {
+                    *cursor_pos = buffer.len();
+                }
+            }
+            KeyAction::InputConfirm => self.execute_input(),
+            KeyAction::InputCancel => {
+                self.mode = AppMode::Normal;
+                self.error_message = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_confirm_key(&mut self, action: KeyAction) {
+        match action {
+            KeyAction::ConfirmYes => self.execute_delete(),
+            KeyAction::ConfirmNo => {
+                self.mode = AppMode::Normal;
+                self.error_message = None;
+            }
+            _ => {}
+        }
+    }
+
+    // --- 네비게이션 ---
 
     fn move_up(&mut self) {
         if self.cursor > 0 {
@@ -147,7 +267,6 @@ impl App {
             if entry.is_dir() || entry.is_parent {
                 let target = entry.path.clone();
 
-                // 진입 전에 대상 디렉토리 읽기 가능 여부를 확인
                 if let Err(e) = std::fs::read_dir(&target) {
                     self.error_message =
                         Some(format!("디렉토리 진입 실패: {}", e));
@@ -165,6 +284,7 @@ impl App {
                 self.current_dir = target;
                 self.cursor = 0;
                 self.scroll_offset = 0;
+                self.selected_indices.clear();
                 self.load_directory();
             }
         }
@@ -181,6 +301,7 @@ impl App {
             self.current_dir = parent.to_path_buf();
             self.cursor = 0;
             self.scroll_offset = 0;
+            self.selected_indices.clear();
             self.load_directory();
         }
     }
@@ -191,6 +312,7 @@ impl App {
             .entries
             .get(self.cursor)
             .map(|e| e.name.clone());
+        self.selected_indices.clear();
         self.load_directory();
         if let Some(name) = current_name {
             self.cursor = self
@@ -200,6 +322,205 @@ impl App {
                 .unwrap_or(0);
         }
     }
+
+    // --- 선택 ---
+
+    fn toggle_select(&mut self) {
+        if let Some(entry) = self.entries.get(self.cursor) {
+            if entry.is_parent {
+                return; // .. 는 선택 불가
+            }
+        }
+        if self.selected_indices.contains(&self.cursor) {
+            self.selected_indices.remove(&self.cursor);
+        } else {
+            self.selected_indices.insert(self.cursor);
+        }
+        // 선택 후 커서를 한 칸 아래로
+        self.move_down();
+    }
+
+    /// CRUD 대상 파일 경로 목록을 반환한다.
+    /// 선택된 파일이 있으면 선택 파일, 없으면 커서 파일.
+    fn target_paths(&self) -> Vec<PathBuf> {
+        if self.selected_indices.is_empty() {
+            if let Some(entry) = self.entries.get(self.cursor) {
+                if !entry.is_parent {
+                    return vec![entry.path.clone()];
+                }
+            }
+            Vec::new()
+        } else {
+            self.selected_indices
+                .iter()
+                .filter_map(|&idx| self.entries.get(idx))
+                .filter(|e| !e.is_parent)
+                .map(|e| e.path.clone())
+                .collect()
+        }
+    }
+
+    fn target_count(&self) -> usize {
+        if self.selected_indices.is_empty() {
+            if let Some(entry) = self.entries.get(self.cursor) {
+                if !entry.is_parent {
+                    return 1;
+                }
+            }
+            0
+        } else {
+            self.selected_indices.len()
+        }
+    }
+
+    // --- CRUD 진입 ---
+
+    fn start_copy(&mut self) {
+        if self.target_count() == 0 {
+            self.error_message = Some("복사할 파일이 없습니다".to_string());
+            return;
+        }
+        let default = self.current_dir.to_string_lossy().to_string();
+        let len = default.len();
+        self.mode = AppMode::Input {
+            purpose: InputPurpose::Copy,
+            buffer: default,
+            prompt: format!("복사 대상 경로 ({}개 파일):", self.target_count()),
+            cursor_pos: len,
+        };
+    }
+
+    fn start_move(&mut self) {
+        if self.target_count() == 0 {
+            self.error_message = Some("이동할 파일이 없습니다".to_string());
+            return;
+        }
+        let default = self.current_dir.to_string_lossy().to_string();
+        let len = default.len();
+        self.mode = AppMode::Input {
+            purpose: InputPurpose::Move,
+            buffer: default,
+            prompt: format!("이동 대상 경로 ({}개 파일):", self.target_count()),
+            cursor_pos: len,
+        };
+    }
+
+    fn start_delete(&mut self) {
+        let count = self.target_count();
+        if count == 0 {
+            self.error_message = Some("삭제할 파일이 없습니다".to_string());
+            return;
+        }
+        let names: Vec<String> = if self.selected_indices.is_empty() {
+            self.entries
+                .get(self.cursor)
+                .map(|e| vec![e.name.clone()])
+                .unwrap_or_default()
+        } else {
+            self.selected_indices
+                .iter()
+                .filter_map(|&idx| self.entries.get(idx))
+                .map(|e| e.name.clone())
+                .collect()
+        };
+        let display = if names.len() <= 3 {
+            names.join(", ")
+        } else {
+            format!("{} 외 {}개", names[0], names.len() - 1)
+        };
+        self.mode = AppMode::Confirm {
+            message: format!("삭제하시겠습니까? [{}] (Y/N)", display),
+        };
+    }
+
+    fn start_rename(&mut self) {
+        if let Some(entry) = self.entries.get(self.cursor) {
+            if entry.is_parent {
+                self.error_message = Some("'..'은 이름 변경할 수 없습니다".to_string());
+                return;
+            }
+            let len = entry.name.len();
+            self.mode = AppMode::Input {
+                purpose: InputPurpose::Rename,
+                buffer: entry.name.clone(),
+                prompt: format!("새 이름 ({}→):", entry.name),
+                cursor_pos: len,
+            };
+        }
+    }
+
+    fn start_mkdir(&mut self) {
+        self.mode = AppMode::Input {
+            purpose: InputPurpose::Mkdir,
+            buffer: String::new(),
+            prompt: "새 디렉토리명:".to_string(),
+            cursor_pos: 0,
+        };
+    }
+
+    // --- CRUD 실행 ---
+
+    fn execute_input(&mut self) {
+        let mode = self.mode.clone();
+        if let AppMode::Input { purpose, buffer, .. } = mode {
+            let result = match purpose {
+                InputPurpose::Copy => self.exec_copy(&buffer),
+                InputPurpose::Move => self.exec_move(&buffer),
+                InputPurpose::Rename => self.exec_rename(&buffer),
+                InputPurpose::Mkdir => self.exec_mkdir(&buffer),
+            };
+            self.mode = AppMode::Normal;
+            if let Err(e) = result {
+                self.error_message = Some(e);
+            } else {
+                self.selected_indices.clear();
+                self.load_directory();
+            }
+        }
+    }
+
+    fn exec_copy(&self, dest: &str) -> Result<(), String> {
+        let dest_path = PathBuf::from(dest);
+        let paths = self.target_paths();
+        let refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
+        file_ops::copy_entries(&refs, &dest_path)
+    }
+
+    fn exec_move(&self, dest: &str) -> Result<(), String> {
+        let dest_path = PathBuf::from(dest);
+        let paths = self.target_paths();
+        let refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
+        file_ops::move_entries(&refs, &dest_path)
+    }
+
+    fn exec_rename(&self, new_name: &str) -> Result<(), String> {
+        if let Some(entry) = self.entries.get(self.cursor) {
+            file_ops::rename_entry(&entry.path, new_name)
+        } else {
+            Err("이름 변경 대상이 없습니다".to_string())
+        }
+    }
+
+    fn exec_mkdir(&self, name: &str) -> Result<(), String> {
+        file_ops::create_directory(&self.current_dir, name)
+    }
+
+    fn execute_delete(&mut self) {
+        let paths = self.target_paths();
+        let refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
+        match file_ops::delete_entries(&refs) {
+            Ok(()) => {
+                self.selected_indices.clear();
+                self.load_directory();
+            }
+            Err(e) => {
+                self.error_message = Some(e);
+            }
+        }
+        self.mode = AppMode::Normal;
+    }
+
+    // --- 유틸 ---
 
     fn clamp_cursor(&mut self) {
         if self.entries.is_empty() {
@@ -222,6 +543,10 @@ impl App {
 
     pub fn file_count(&self) -> usize {
         self.entries.iter().filter(|e| !e.is_dir()).count()
+    }
+
+    pub fn selected_count(&self) -> usize {
+        self.selected_indices.len()
     }
 }
 
@@ -251,14 +576,17 @@ mod tests {
         (app, dir)
     }
 
+    // --- Phase 1 기존 테스트 ---
+
     #[test]
     fn test_initial_state() {
         let (app, _dir) = create_test_app();
         assert_eq!(app.cursor, 0);
         assert!(!app.should_quit);
         assert!(!app.entries.is_empty());
-        // .. + 2 dirs + 2 files (hidden excluded)
         assert_eq!(app.entries.len(), 5);
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(app.selected_indices.is_empty());
     }
 
     #[test]
@@ -276,14 +604,14 @@ mod tests {
     fn test_cursor_bounds() {
         let (mut app, _dir) = create_test_app();
         app.handle_key(KeyAction::MoveUp);
-        assert_eq!(app.cursor, 0); // 0 이하로 내려가지 않음
+        assert_eq!(app.cursor, 0);
 
         app.handle_key(KeyAction::End);
         let last = app.entries.len() - 1;
         assert_eq!(app.cursor, last);
 
         app.handle_key(KeyAction::MoveDown);
-        assert_eq!(app.cursor, last); // 마지막을 넘지 않음
+        assert_eq!(app.cursor, last);
     }
 
     #[test]
@@ -298,7 +626,6 @@ mod tests {
     #[test]
     fn test_enter_directory() {
         let (mut app, _dir) = create_test_app();
-        // 커서를 alpha_dir로 이동 (index 1: .. 다음)
         app.handle_key(KeyAction::MoveDown);
         assert!(app.entries[app.cursor].is_dir());
 
@@ -313,15 +640,12 @@ mod tests {
         let sub = dir.path().join("alpha_dir");
         fs::write(sub.join("inner.txt"), "in").unwrap();
 
-        // alpha_dir 진입
         app.handle_key(KeyAction::MoveDown);
         app.handle_key(KeyAction::Enter);
         assert!(app.current_dir.ends_with("alpha_dir"));
 
-        // Backspace로 상위로
         app.handle_key(KeyAction::Backspace);
         assert_eq!(app.current_dir, dir.path());
-        // 커서가 alpha_dir에 위치해야 함
         assert_eq!(app.entries[app.cursor].name, "alpha_dir");
     }
 
@@ -354,7 +678,6 @@ mod tests {
     fn test_column_movement() {
         let (mut app, _dir) = create_test_app();
         app.rows_per_col = 2;
-        // 5개 항목, rows_per_col=2이면 좌/우 이동은 ±2
         app.cursor = 0;
         app.handle_key(KeyAction::MoveRight);
         assert_eq!(app.cursor, 2);
@@ -373,7 +696,7 @@ mod tests {
     fn test_empty_directory() {
         let dir = tempfile::tempdir().unwrap();
         let app = App::new(dir.path().to_path_buf());
-        assert_eq!(app.entries.len(), 1); // .. 만 존재
+        assert_eq!(app.entries.len(), 1);
         assert!(app.entries[0].is_parent);
     }
 
@@ -382,7 +705,7 @@ mod tests {
         let (mut app, _dir) = create_test_app();
         app.cursor = 2;
         app.handle_key(KeyAction::Noop);
-        assert_eq!(app.cursor, 2); // 커서 변경 없음
+        assert_eq!(app.cursor, 2);
     }
 
     #[test]
@@ -391,7 +714,6 @@ mod tests {
         let restricted = dir.path().join("restricted_dir");
         fs::create_dir(&restricted).unwrap();
 
-        // 권한 제거
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -402,7 +724,6 @@ mod tests {
         let original_dir = app.current_dir.clone();
         let original_entries_len = app.entries.len();
 
-        // restricted_dir로 커서 이동
         let restricted_idx = app
             .entries
             .iter()
@@ -410,16 +731,14 @@ mod tests {
             .unwrap();
         app.cursor = restricted_idx;
 
-        // Enter 시도 - 권한 에러로 현재 위치 유지되어야 함
         app.handle_key(KeyAction::Enter);
 
         #[cfg(unix)]
         {
-            assert_eq!(app.current_dir, original_dir, "current_dir이 변경되면 안 됨");
-            assert_eq!(app.entries.len(), original_entries_len, "entries가 변경되면 안 됨");
-            assert!(app.error_message.is_some(), "에러 메시지가 설정되어야 함");
+            assert_eq!(app.current_dir, original_dir);
+            assert_eq!(app.entries.len(), original_entries_len);
+            assert!(app.error_message.is_some());
 
-            // 권한 복원 (정리용)
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&restricted, fs::Permissions::from_mode(0o755)).unwrap();
         }
@@ -430,7 +749,7 @@ mod tests {
         let mut app = App::new(std::path::PathBuf::from("/"));
         let original_dir = app.current_dir.clone();
         app.handle_key(KeyAction::Backspace);
-        assert_eq!(app.current_dir, original_dir, "루트에서 Backspace 시 위치 유지");
+        assert_eq!(app.current_dir, original_dir);
     }
 
     #[test]
@@ -438,22 +757,18 @@ mod tests {
         let (mut app, _dir) = create_test_app();
         app.rows_per_col = 2;
 
-        // PageDown: cursor 0 → 2 (rows_per_col만큼 이동)
         app.cursor = 0;
         app.handle_key(KeyAction::PageDown);
         assert_eq!(app.cursor, 2);
 
-        // PageDown 경계: 마지막 넘어가면 마지막 항목으로
-        app.cursor = 4; // 마지막 항목
+        app.cursor = 4;
         app.handle_key(KeyAction::PageDown);
-        assert_eq!(app.cursor, 4); // 마지막 유지
+        assert_eq!(app.cursor, 4);
 
-        // PageUp: cursor 3 → 1 (rows_per_col만큼 역이동)
         app.cursor = 3;
         app.handle_key(KeyAction::PageUp);
         assert_eq!(app.cursor, 1);
 
-        // PageUp 경계: 0 이하로 안 내려감
         app.cursor = 0;
         app.handle_key(KeyAction::PageUp);
         assert_eq!(app.cursor, 0);
@@ -462,7 +777,6 @@ mod tests {
     #[test]
     fn test_enter_on_file() {
         let (mut app, _dir) = create_test_app();
-        // 파일 항목으로 이동 (디렉토리가 아닌 것)
         let file_idx = app
             .entries
             .iter()
@@ -472,7 +786,7 @@ mod tests {
 
         let original_dir = app.current_dir.clone();
         app.handle_key(KeyAction::Enter);
-        assert_eq!(app.current_dir, original_dir, "파일에 Enter 시 디렉토리 변경 없음");
+        assert_eq!(app.current_dir, original_dir);
     }
 
     #[test]
@@ -481,16 +795,13 @@ mod tests {
         let sub = dir.path().join("alpha_dir");
         fs::write(sub.join("inner.txt"), "in").unwrap();
 
-        // alpha_dir 진입
         app.handle_key(KeyAction::MoveDown);
         app.handle_key(KeyAction::Enter);
 
-        // .. (parent) 항목에 Enter
         assert_eq!(app.cursor, 0);
         assert!(app.entries[0].is_parent);
         app.handle_key(KeyAction::Enter);
 
-        // 상위로 이동 + 커서가 alpha_dir에 복원
         assert_eq!(app.current_dir, dir.path());
         assert_eq!(app.entries[app.cursor].name, "alpha_dir");
     }
@@ -503,7 +814,7 @@ mod tests {
             name: "big.bin".to_string(),
             path: std::path::PathBuf::from("big.bin"),
             entry_type: EntryType::File,
-            size: 5_242_880, // 5MB
+            size: 5_242_880,
             modified: None,
             is_parent: false,
         };
@@ -513,7 +824,7 @@ mod tests {
             name: "huge.iso".to_string(),
             path: std::path::PathBuf::from("huge.iso"),
             entry_type: EntryType::File,
-            size: 2_147_483_648, // 2GB
+            size: 2_147_483_648,
             modified: None,
             is_parent: false,
         };
@@ -526,14 +837,362 @@ mod tests {
 
         app.update_layout(60, 30);
         assert_eq!(app.columns, 1);
-        assert_eq!(app.rows_per_col, 27); // 30 - 3
+        assert_eq!(app.rows_per_col, 27);
 
         app.update_layout(100, 40);
         assert_eq!(app.columns, 2);
-        assert_eq!(app.rows_per_col, 37); // 40 - 3
+        assert_eq!(app.rows_per_col, 37);
 
         app.update_layout(150, 50);
         assert_eq!(app.columns, 3);
-        assert_eq!(app.rows_per_col, 47); // 50 - 3
+        assert_eq!(app.rows_per_col, 47);
+    }
+
+    // --- Phase 2 선택 테스트 ---
+
+    #[test]
+    fn test_select_toggle() {
+        let (mut app, _dir) = create_test_app();
+        // 커서를 첫 번째 디렉토리로 이동 (index 1: alpha_dir)
+        app.cursor = 1;
+        app.handle_key(KeyAction::Select);
+        assert!(app.selected_indices.contains(&1));
+        assert_eq!(app.cursor, 2); // 자동 다음 이동
+
+        // 다시 선택 해제
+        app.cursor = 1;
+        app.handle_key(KeyAction::Select);
+        assert!(!app.selected_indices.contains(&1));
+    }
+
+    #[test]
+    fn test_select_parent_blocked() {
+        let (mut app, _dir) = create_test_app();
+        // cursor 0 = ".."
+        app.cursor = 0;
+        app.handle_key(KeyAction::Select);
+        assert!(app.selected_indices.is_empty());
+    }
+
+    #[test]
+    fn test_select_cleared_on_dir_change() {
+        let (mut app, _dir) = create_test_app();
+        app.cursor = 1;
+        app.handle_key(KeyAction::Select);
+        assert!(!app.selected_indices.is_empty());
+
+        // 디렉토리 진입 시 선택 초기화
+        app.cursor = 1; // alpha_dir
+        app.handle_key(KeyAction::Enter);
+        assert!(app.selected_indices.is_empty());
+    }
+
+    #[test]
+    fn test_selected_count() {
+        let (mut app, _dir) = create_test_app();
+        assert_eq!(app.selected_count(), 0);
+
+        app.cursor = 1;
+        app.handle_key(KeyAction::Select); // alpha_dir 선택
+        app.handle_key(KeyAction::Select); // beta_dir 선택
+        assert_eq!(app.selected_count(), 2);
+    }
+
+    // --- Phase 2 CRUD 테스트 ---
+
+    #[test]
+    fn test_start_copy_enters_input_mode() {
+        let (mut app, _dir) = create_test_app();
+        app.cursor = 3; // file_a.txt
+        app.handle_key(KeyAction::Copy);
+        match &app.mode {
+            AppMode::Input { purpose, .. } => assert_eq!(*purpose, InputPurpose::Copy),
+            _ => panic!("Copy 키로 Input 모드 진입 실패"),
+        }
+    }
+
+    #[test]
+    fn test_start_delete_enters_confirm_mode() {
+        let (mut app, _dir) = create_test_app();
+        app.cursor = 3; // file_a.txt
+        app.handle_key(KeyAction::Delete);
+        match &app.mode {
+            AppMode::Confirm { message } => assert!(message.contains("삭제")),
+            _ => panic!("Delete 키로 Confirm 모드 진입 실패"),
+        }
+    }
+
+    #[test]
+    fn test_start_rename_enters_input_mode() {
+        let (mut app, _dir) = create_test_app();
+        app.cursor = 3; // file_a.txt
+        app.handle_key(KeyAction::Rename);
+        match &app.mode {
+            AppMode::Input { purpose, buffer, cursor_pos, .. } => {
+                assert_eq!(*purpose, InputPurpose::Rename);
+                assert_eq!(buffer, "file_a.txt");
+                assert_eq!(*cursor_pos, buffer.len());
+            }
+            _ => panic!("Rename 키로 Input 모드 진입 실패"),
+        }
+    }
+
+    #[test]
+    fn test_start_mkdir_enters_input_mode() {
+        let (mut app, _) = create_test_app();
+        app.handle_key(KeyAction::Mkdir);
+        match &app.mode {
+            AppMode::Input { purpose, buffer, cursor_pos, .. } => {
+                assert_eq!(*purpose, InputPurpose::Mkdir);
+                assert!(buffer.is_empty());
+                assert_eq!(*cursor_pos, 0);
+            }
+            _ => panic!("Mkdir 키로 Input 모드 진입 실패"),
+        }
+    }
+
+    #[test]
+    fn test_input_char_and_backspace() {
+        let (mut app, _dir) = create_test_app();
+        app.handle_key(KeyAction::Mkdir);
+
+        app.handle_key(KeyAction::InputChar('a'));
+        app.handle_key(KeyAction::InputChar('b'));
+        app.handle_key(KeyAction::InputChar('c'));
+
+        if let AppMode::Input { buffer, cursor_pos, .. } = &app.mode {
+            assert_eq!(buffer, "abc");
+            assert_eq!(*cursor_pos, 3);
+        } else {
+            panic!("Input 모드가 아님");
+        }
+
+        app.handle_key(KeyAction::InputBackspace);
+        if let AppMode::Input { buffer, cursor_pos, .. } = &app.mode {
+            assert_eq!(buffer, "ab");
+            assert_eq!(*cursor_pos, 2);
+        }
+    }
+
+    #[test]
+    fn test_input_cursor_movement() {
+        let (mut app, _dir) = create_test_app();
+        app.handle_key(KeyAction::Mkdir);
+
+        // "abcde" 입력
+        for c in "abcde".chars() {
+            app.handle_key(KeyAction::InputChar(c));
+        }
+
+        // Left로 커서 이동
+        app.handle_key(KeyAction::InputCursorLeft);
+        app.handle_key(KeyAction::InputCursorLeft);
+        if let AppMode::Input { cursor_pos, .. } = &app.mode {
+            assert_eq!(*cursor_pos, 3); // "abc|de"
+        }
+
+        // 중간에 문자 삽입
+        app.handle_key(KeyAction::InputChar('X'));
+        if let AppMode::Input { buffer, cursor_pos, .. } = &app.mode {
+            assert_eq!(buffer, "abcXde");
+            assert_eq!(*cursor_pos, 4);
+        }
+
+        // Backspace로 커서 앞 문자 삭제
+        app.handle_key(KeyAction::InputBackspace);
+        if let AppMode::Input { buffer, cursor_pos, .. } = &app.mode {
+            assert_eq!(buffer, "abcde");
+            assert_eq!(*cursor_pos, 3);
+        }
+
+        // Delete로 커서 뒤 문자 삭제
+        app.handle_key(KeyAction::InputDelete);
+        if let AppMode::Input { buffer, cursor_pos, .. } = &app.mode {
+            assert_eq!(buffer, "abce");
+            assert_eq!(*cursor_pos, 3);
+        }
+
+        // Home으로 처음으로
+        app.handle_key(KeyAction::InputCursorHome);
+        if let AppMode::Input { cursor_pos, .. } = &app.mode {
+            assert_eq!(*cursor_pos, 0);
+        }
+
+        // End로 끝으로
+        app.handle_key(KeyAction::InputCursorEnd);
+        if let AppMode::Input { buffer, cursor_pos, .. } = &app.mode {
+            assert_eq!(*cursor_pos, buffer.len());
+        }
+    }
+
+    #[test]
+    fn test_input_cursor_boundary() {
+        let (mut app, _dir) = create_test_app();
+        app.handle_key(KeyAction::Mkdir);
+
+        // 빈 상태에서 Left/Backspace/Delete 안전
+        app.handle_key(KeyAction::InputCursorLeft);
+        app.handle_key(KeyAction::InputBackspace);
+        app.handle_key(KeyAction::InputDelete);
+        if let AppMode::Input { buffer, cursor_pos, .. } = &app.mode {
+            assert_eq!(buffer, "");
+            assert_eq!(*cursor_pos, 0);
+        }
+
+        // "ab" 입력 후 End에서 Right 무시
+        app.handle_key(KeyAction::InputChar('a'));
+        app.handle_key(KeyAction::InputChar('b'));
+        app.handle_key(KeyAction::InputCursorRight);
+        if let AppMode::Input { cursor_pos, .. } = &app.mode {
+            assert_eq!(*cursor_pos, 2); // 끝에서 더 안 감
+        }
+
+        // 끝에서 Delete 무시
+        app.handle_key(KeyAction::InputDelete);
+        if let AppMode::Input { buffer, .. } = &app.mode {
+            assert_eq!(buffer, "ab");
+        }
+    }
+
+    #[test]
+    fn test_input_cancel() {
+        let (mut app, _dir) = create_test_app();
+        app.handle_key(KeyAction::Mkdir);
+        assert!(matches!(app.mode, AppMode::Input { .. }));
+
+        app.handle_key(KeyAction::InputCancel);
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn test_confirm_no_cancels() {
+        let (mut app, _dir) = create_test_app();
+        app.cursor = 3;
+        app.handle_key(KeyAction::Delete);
+        assert!(matches!(app.mode, AppMode::Confirm { .. }));
+
+        app.handle_key(KeyAction::ConfirmNo);
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn test_mkdir_execute() {
+        let (mut app, dir) = create_test_app();
+        app.handle_key(KeyAction::Mkdir);
+
+        // "new_dir" 입력
+        for c in "new_dir".chars() {
+            app.handle_key(KeyAction::InputChar(c));
+        }
+        app.handle_key(KeyAction::InputConfirm);
+
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(dir.path().join("new_dir").is_dir());
+        assert!(app.entries.iter().any(|e| e.name == "new_dir"));
+    }
+
+    #[test]
+    fn test_delete_execute() {
+        let (mut app, dir) = create_test_app();
+        // file_a.txt 선택 후 삭제
+        app.cursor = 3; // file_a.txt
+        app.handle_key(KeyAction::Delete);
+        app.handle_key(KeyAction::ConfirmYes);
+
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(!dir.path().join("file_a.txt").exists());
+    }
+
+    #[test]
+    fn test_rename_execute() {
+        let (mut app, dir) = create_test_app();
+        app.cursor = 3; // file_a.txt
+        app.handle_key(KeyAction::Rename);
+
+        // 기존 이름 지우고 새 이름 입력
+        // buffer에는 "file_a.txt"가 들어있으므로 전체 지우고 새 이름
+        // 실제로는 사용자가 수정하겠지만, 테스트에서는 직접 buffer 교체
+        if let AppMode::Input { buffer, .. } = &mut app.mode {
+            buffer.clear();
+            buffer.push_str("renamed.txt");
+        }
+        app.handle_key(KeyAction::InputConfirm);
+
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(!dir.path().join("file_a.txt").exists());
+        assert!(dir.path().join("renamed.txt").exists());
+    }
+
+    #[test]
+    fn test_copy_execute() {
+        let (mut app, dir) = create_test_app();
+        let dest = tempfile::tempdir().unwrap();
+
+        app.cursor = 3; // file_a.txt
+        app.handle_key(KeyAction::Copy);
+
+        // buffer를 dest 경로로 교체
+        if let AppMode::Input { buffer, .. } = &mut app.mode {
+            buffer.clear();
+            buffer.push_str(&dest.path().to_string_lossy());
+        }
+        app.handle_key(KeyAction::InputConfirm);
+
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(dir.path().join("file_a.txt").exists()); // 원본 유지
+        assert!(dest.path().join("file_a.txt").exists()); // 복사됨
+    }
+
+    #[test]
+    fn test_move_execute() {
+        let (mut app, dir) = create_test_app();
+        let dest = tempfile::tempdir().unwrap();
+
+        app.cursor = 3; // file_a.txt
+        app.handle_key(KeyAction::Move);
+
+        if let AppMode::Input { buffer, .. } = &mut app.mode {
+            buffer.clear();
+            buffer.push_str(&dest.path().to_string_lossy());
+        }
+        app.handle_key(KeyAction::InputConfirm);
+
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(!dir.path().join("file_a.txt").exists()); // 원본 삭제됨
+        assert!(dest.path().join("file_a.txt").exists()); // 이동됨
+    }
+
+    #[test]
+    fn test_crud_on_parent_blocked() {
+        let (mut app, _dir) = create_test_app();
+        app.cursor = 0; // ".."
+
+        app.handle_key(KeyAction::Delete);
+        // ".."는 target_count가 0이므로 에러 메시지
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(app.error_message.is_some());
+    }
+
+    #[test]
+    fn test_crud_with_selection() {
+        let (mut app, _dir) = create_test_app();
+        let dest = tempfile::tempdir().unwrap();
+
+        // 두 파일 선택
+        app.cursor = 3; // file_a.txt
+        app.handle_key(KeyAction::Select);
+        app.cursor = 4; // file_b.txt
+        app.handle_key(KeyAction::Select);
+
+        app.handle_key(KeyAction::Copy);
+        if let AppMode::Input { buffer, prompt, .. } = &mut app.mode {
+            assert!(prompt.contains("2개"));
+            buffer.clear();
+            buffer.push_str(&dest.path().to_string_lossy());
+        }
+        app.handle_key(KeyAction::InputConfirm);
+
+        assert!(dest.path().join("file_a.txt").exists());
+        assert!(dest.path().join("file_b.txt").exists());
     }
 }
