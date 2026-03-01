@@ -1,0 +1,6 @@
+/target
+rules/
+report/
+.bkit/
+.idea/
+GOAL.md
