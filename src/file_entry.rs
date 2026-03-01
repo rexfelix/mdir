@@ -70,6 +70,55 @@ impl FileEntry {
         self.name.starts_with('.')
     }
 
+    pub fn is_executable(&self) -> bool {
+        if self.is_dir() || self.is_parent {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = fs::metadata(&self.path) {
+                return meta.permissions().mode() & 0o111 != 0;
+            }
+        }
+        false
+    }
+
+    pub fn is_archive(&self) -> bool {
+        const ARCHIVE_EXTS: &[&str] = &[
+            ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar", ".tgz",
+            ".tar.gz", ".tar.bz2", ".tar.xz", ".zst", ".lz4",
+        ];
+        let lower = self.name.to_lowercase();
+        ARCHIVE_EXTS.iter().any(|ext| lower.ends_with(ext))
+    }
+
+    pub fn is_symlink(&self) -> bool {
+        self.entry_type == EntryType::Symlink
+    }
+
+    pub fn display_permissions(&self) -> String {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = fs::symlink_metadata(&self.path) {
+                let mode = meta.permissions().mode();
+                let mut s = String::with_capacity(9);
+                s.push(if mode & 0o400 != 0 { 'r' } else { '-' });
+                s.push(if mode & 0o200 != 0 { 'w' } else { '-' });
+                s.push(if mode & 0o100 != 0 { 'x' } else { '-' });
+                s.push(if mode & 0o040 != 0 { 'r' } else { '-' });
+                s.push(if mode & 0o020 != 0 { 'w' } else { '-' });
+                s.push(if mode & 0o010 != 0 { 'x' } else { '-' });
+                s.push(if mode & 0o004 != 0 { 'r' } else { '-' });
+                s.push(if mode & 0o002 != 0 { 'w' } else { '-' });
+                s.push(if mode & 0o001 != 0 { 'x' } else { '-' });
+                return s;
+            }
+        }
+        "---------".to_string()
+    }
+
     pub fn display_size(&self) -> String {
         if self.is_dir() {
             "<DIR>".to_string()
@@ -231,5 +280,101 @@ mod tests {
         let entries = read_directory(dir.path(), false).unwrap();
         assert_eq!(entries.len(), 1);
         assert!(entries[0].is_parent);
+    }
+
+    // --- Phase 3 테스트 ---
+
+    #[test]
+    fn test_is_archive() {
+        let archives = vec!["file.zip", "data.tar.gz", "img.7z", "backup.rar", "src.tar.xz"];
+        for name in archives {
+            let entry = FileEntry {
+                name: name.to_string(),
+                path: PathBuf::from(name),
+                entry_type: EntryType::File,
+                size: 100,
+                modified: None,
+                is_parent: false,
+            };
+            assert!(entry.is_archive(), "{} should be archive", name);
+        }
+
+        let non_archives = vec!["readme.txt", "main.rs", "photo.jpg"];
+        for name in non_archives {
+            let entry = FileEntry {
+                name: name.to_string(),
+                path: PathBuf::from(name),
+                entry_type: EntryType::File,
+                size: 100,
+                modified: None,
+                is_parent: false,
+            };
+            assert!(!entry.is_archive(), "{} should not be archive", name);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exec_path = dir.path().join("run.sh");
+        fs::write(&exec_path, "#!/bin/sh").unwrap();
+        fs::set_permissions(&exec_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let entry = FileEntry::from_path(&exec_path).unwrap();
+        assert!(entry.is_executable());
+
+        let normal_path = dir.path().join("data.txt");
+        fs::write(&normal_path, "hello").unwrap();
+        fs::set_permissions(&normal_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let entry2 = FileEntry::from_path(&normal_path).unwrap();
+        assert!(!entry2.is_executable());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_display_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        fs::write(&path, "hello").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let entry = FileEntry::from_path(&path).unwrap();
+        assert_eq!(entry.display_permissions(), "rw-r--r--");
+
+        let exec_path = dir.path().join("run.sh");
+        fs::write(&exec_path, "#!/bin/sh").unwrap();
+        fs::set_permissions(&exec_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let entry2 = FileEntry::from_path(&exec_path).unwrap();
+        assert_eq!(entry2.display_permissions(), "rwxr-xr-x");
+    }
+
+    #[test]
+    fn test_is_symlink() {
+        let entry = FileEntry {
+            name: "link".to_string(),
+            path: PathBuf::from("link"),
+            entry_type: EntryType::Symlink,
+            size: 0,
+            modified: None,
+            is_parent: false,
+        };
+        assert!(entry.is_symlink());
+
+        let entry2 = FileEntry {
+            name: "file.txt".to_string(),
+            path: PathBuf::from("file.txt"),
+            entry_type: EntryType::File,
+            size: 0,
+            modified: None,
+            is_parent: false,
+        };
+        assert!(!entry2.is_symlink());
     }
 }

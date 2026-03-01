@@ -94,10 +94,8 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
-            } else if entry.is_dir() {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                entry_color(entry)
             };
 
             lines.push(Line::from(Span::styled(name_display, style)));
@@ -117,10 +115,11 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 
     let info = if let Some(entry) = app.selected_entry() {
         format!(
-            " {} │ {} │ {}{}",
+            " {} │ {} │ {} │ {}{}",
             entry.name,
             entry.display_size(),
             entry.display_date(),
+            entry.display_permissions(),
             selected_info
         )
     } else {
@@ -136,10 +135,17 @@ fn render_info_bar(frame: &mut Frame, app: &App, area: Rect) {
     let text = if let Some(err) = &app.error_message {
         format!(" ⚠ {}", err)
     } else {
+        let disk = match app.disk_usage() {
+            Some((used, total, percent)) => {
+                format!(" │ 디스크: {}/{} ({}%)", format_bytes(used), format_bytes(total), percent)
+            }
+            None => String::new(),
+        };
         format!(
-            " 디렉토리: {} │ 파일: {} │ Space:선택 C:복사 M:이동 D:삭제 R:이름변경 K:새폴더 Q:종료",
+            " Dir:{} File:{}{} │ C M D R K Q",
             app.dir_count(),
-            app.file_count()
+            app.file_count(),
+            disk
         )
     };
 
@@ -180,6 +186,20 @@ fn render_input_bar(frame: &mut Frame, prompt: &str, buffer: &str, cursor_pos: u
     frame.render_widget(bar, area);
 }
 
+fn entry_color(entry: &crate::file_entry::FileEntry) -> Style {
+    if entry.is_dir() {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else if entry.is_symlink() {
+        Style::default().fg(Color::Magenta)
+    } else if entry.is_archive() {
+        Style::default().fg(Color::Yellow)
+    } else if entry.is_executable() {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::White)
+    }
+}
+
 fn render_confirm_bar(frame: &mut Frame, message: &str, area: Rect) {
     let text = format!(" {}", message);
     let bar = Paragraph::new(Line::from(text))
@@ -206,6 +226,18 @@ fn format_entry_name(entry: &crate::file_entry::FileEntry, max_width: usize, sel
     };
 
     format!("{}{:<width$} {:>size_w$}", marker, truncated, size_str, width = name_max, size_w = size_col)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_099_511_627_776 {
+        format!("{:.1}T", bytes as f64 / 1_099_511_627_776.0)
+    } else if bytes >= 1_073_741_824 {
+        format!("{:.1}G", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.0}M", bytes as f64 / 1_048_576.0)
+    } else {
+        format!("{}K", bytes / 1024)
+    }
 }
 
 fn truncate_path(path: &str, max_len: usize) -> String {
@@ -287,5 +319,75 @@ mod tests {
         };
         let formatted = format_entry_name(&entry, 25, false);
         assert!(formatted.contains("..."));
+    }
+
+    // --- Phase 3 테스트 ---
+
+    #[test]
+    fn test_entry_color_directory() {
+        use crate::file_entry::{EntryType, FileEntry};
+        use std::path::PathBuf;
+
+        let dir = FileEntry {
+            name: "src".to_string(),
+            path: PathBuf::from("src"),
+            entry_type: EntryType::Directory,
+            size: 0,
+            modified: None,
+            is_parent: false,
+        };
+        let style = entry_color(&dir);
+        assert_eq!(style.fg, Some(Color::Cyan));
+    }
+
+    #[test]
+    fn test_entry_color_symlink() {
+        use crate::file_entry::{EntryType, FileEntry};
+        use std::path::PathBuf;
+
+        let link = FileEntry {
+            name: "link".to_string(),
+            path: PathBuf::from("link"),
+            entry_type: EntryType::Symlink,
+            size: 0,
+            modified: None,
+            is_parent: false,
+        };
+        let style = entry_color(&link);
+        assert_eq!(style.fg, Some(Color::Magenta));
+    }
+
+    #[test]
+    fn test_entry_color_archive() {
+        use crate::file_entry::{EntryType, FileEntry};
+        use std::path::PathBuf;
+
+        let archive = FileEntry {
+            name: "backup.tar.gz".to_string(),
+            path: PathBuf::from("backup.tar.gz"),
+            entry_type: EntryType::File,
+            size: 1000,
+            modified: None,
+            is_parent: false,
+        };
+        let style = entry_color(&archive);
+        assert_eq!(style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn test_entry_color_normal_file() {
+        use crate::file_entry::{EntryType, FileEntry};
+        use std::path::PathBuf;
+
+        let file = FileEntry {
+            name: "readme.txt".to_string(),
+            path: PathBuf::from("readme.txt"),
+            entry_type: EntryType::File,
+            size: 100,
+            modified: None,
+            is_parent: false,
+        };
+        let style = entry_color(&file);
+        assert_eq!(style.fg, Some(Color::White));
     }
 }

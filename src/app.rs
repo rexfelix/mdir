@@ -548,6 +548,40 @@ impl App {
     pub fn selected_count(&self) -> usize {
         self.selected_indices.len()
     }
+
+    /// 현재 디렉토리의 디스크 사용량을 반환한다.
+    /// (사용량 바이트, 전체 바이트, 사용률 퍼센트)
+    pub fn disk_usage(&self) -> Option<(u64, u64, u8)> {
+        disk_usage_for_path(&self.current_dir)
+    }
+}
+
+#[cfg(unix)]
+fn disk_usage_for_path(path: &std::path::Path) -> Option<(u64, u64, u8)> {
+    use std::ffi::CString;
+    let c_path = CString::new(path.to_string_lossy().as_bytes()).ok()?;
+    unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
+            let block_size = stat.f_frsize as u64;
+            let total = stat.f_blocks as u64 * block_size;
+            let available = stat.f_bavail as u64 * block_size;
+            let used = total.saturating_sub(available);
+            let percent = if total > 0 {
+                (used as f64 / total as f64 * 100.0) as u8
+            } else {
+                0
+            };
+            Some((used, total, percent))
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn disk_usage_for_path(_path: &std::path::Path) -> Option<(u64, u64, u8)> {
+    None
 }
 
 pub fn calculate_columns(width: u16) -> usize {
@@ -1194,5 +1228,19 @@ mod tests {
 
         assert!(dest.path().join("file_a.txt").exists());
         assert!(dest.path().join("file_b.txt").exists());
+    }
+
+    // --- Phase 3 테스트 ---
+
+    #[cfg(unix)]
+    #[test]
+    fn test_disk_usage() {
+        let (app, _dir) = create_test_app();
+        let usage = app.disk_usage();
+        assert!(usage.is_some());
+        let (used, total, percent) = usage.unwrap();
+        assert!(total > 0);
+        assert!(used <= total);
+        assert!(percent <= 100);
     }
 }
