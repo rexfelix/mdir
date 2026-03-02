@@ -62,6 +62,25 @@ pub enum KeyAction {
     ViewerSearchBackspace,
     ViewerSearchConfirm,
     ViewerSearchCancel,
+    // 에디터 모드
+    Edit,
+    EditorChar(char),
+    EditorBackspace,
+    EditorDelete,
+    EditorEnter,
+    EditorUp,
+    EditorDown,
+    EditorLeft,
+    EditorRight,
+    EditorHome,
+    EditorEnd,
+    EditorPageUp,
+    EditorPageDown,
+    EditorSave,
+    EditorClose,
+    // 에디터 종료 확인 모드
+    EditorConfirmYes,
+    EditorConfirmNo,
     // 도움말 모드
     Help,
     HelpUp,
@@ -84,6 +103,8 @@ pub enum InputMode {
     Confirm,
     Viewer,
     ViewerSearch,
+    Editor,
+    EditorConfirmClose,
     Help,
 }
 
@@ -97,6 +118,8 @@ pub fn poll_event_with_mode(timeout: Duration, mode: InputMode) -> std::io::Resu
                     InputMode::Confirm => map_key_confirm(key),
                     InputMode::Viewer => map_key_viewer(key),
                     InputMode::ViewerSearch => map_key_viewer_search(key),
+                    InputMode::Editor => map_key_editor(key),
+                    InputMode::EditorConfirmClose => map_key_editor_confirm(key),
                     InputMode::Help => map_key_help(key),
                 };
                 Ok(AppEvent::Key(action))
@@ -131,6 +154,7 @@ fn map_key_normal(key: KeyEvent) -> KeyAction {
         KeyCode::Char('r') | KeyCode::Char('R') => KeyAction::Rename,
         KeyCode::Char('k') | KeyCode::Char('K') => KeyAction::Mkdir,
         KeyCode::Char('n') | KeyCode::Char('N') => KeyAction::NewFile,
+        KeyCode::Char('e') | KeyCode::Char('E') => KeyAction::Edit,
         KeyCode::Char('v') | KeyCode::Char('V') => KeyAction::View,
         KeyCode::Char('f') | KeyCode::Char('F') => KeyAction::FileSearch,
         KeyCode::Char('?') => KeyAction::Help,
@@ -191,6 +215,34 @@ fn map_key_help(key: KeyEvent) -> KeyAction {
         KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc | KeyCode::Char('?') => {
             KeyAction::HelpClose
         }
+        _ => KeyAction::Noop,
+    }
+}
+
+fn map_key_editor(key: KeyEvent) -> KeyAction {
+    match key.code {
+        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyAction::EditorSave,
+        KeyCode::Esc => KeyAction::EditorClose,
+        KeyCode::Up => KeyAction::EditorUp,
+        KeyCode::Down => KeyAction::EditorDown,
+        KeyCode::Left => KeyAction::EditorLeft,
+        KeyCode::Right => KeyAction::EditorRight,
+        KeyCode::Home => KeyAction::EditorHome,
+        KeyCode::End => KeyAction::EditorEnd,
+        KeyCode::PageUp => KeyAction::EditorPageUp,
+        KeyCode::PageDown => KeyAction::EditorPageDown,
+        KeyCode::Backspace => KeyAction::EditorBackspace,
+        KeyCode::Delete => KeyAction::EditorDelete,
+        KeyCode::Enter => KeyAction::EditorEnter,
+        KeyCode::Char(c) => KeyAction::EditorChar(c),
+        _ => KeyAction::Noop,
+    }
+}
+
+fn map_key_editor_confirm(key: KeyEvent) -> KeyAction {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => KeyAction::EditorConfirmYes,
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => KeyAction::EditorConfirmNo,
         _ => KeyAction::Noop,
     }
 }
@@ -530,6 +582,90 @@ mod tests {
         assert_eq!(
             map_key_help(make_key(KeyCode::Char('?'), KeyModifiers::NONE)),
             KeyAction::HelpClose
+        );
+    }
+
+    #[test]
+    fn test_edit_key() {
+        assert_eq!(
+            map_key_normal(make_key(KeyCode::Char('e'), KeyModifiers::NONE)),
+            KeyAction::Edit
+        );
+    }
+
+    #[test]
+    fn test_editor_mode_keys() {
+        assert_eq!(
+            map_key_editor(make_key(KeyCode::Char('a'), KeyModifiers::NONE)),
+            KeyAction::EditorChar('a')
+        );
+        assert_eq!(
+            map_key_editor(make_key(KeyCode::Backspace, KeyModifiers::NONE)),
+            KeyAction::EditorBackspace
+        );
+        assert_eq!(
+            map_key_editor(make_key(KeyCode::Delete, KeyModifiers::NONE)),
+            KeyAction::EditorDelete
+        );
+        assert_eq!(
+            map_key_editor(make_key(KeyCode::Enter, KeyModifiers::NONE)),
+            KeyAction::EditorEnter
+        );
+        assert_eq!(
+            map_key_editor(make_key(KeyCode::Up, KeyModifiers::NONE)),
+            KeyAction::EditorUp
+        );
+        assert_eq!(
+            map_key_editor(make_key(KeyCode::Down, KeyModifiers::NONE)),
+            KeyAction::EditorDown
+        );
+        assert_eq!(
+            map_key_editor(make_key(KeyCode::Left, KeyModifiers::NONE)),
+            KeyAction::EditorLeft
+        );
+        assert_eq!(
+            map_key_editor(make_key(KeyCode::Right, KeyModifiers::NONE)),
+            KeyAction::EditorRight
+        );
+        assert_eq!(
+            map_key_editor(make_key(KeyCode::Home, KeyModifiers::NONE)),
+            KeyAction::EditorHome
+        );
+        assert_eq!(
+            map_key_editor(make_key(KeyCode::End, KeyModifiers::NONE)),
+            KeyAction::EditorEnd
+        );
+        assert_eq!(
+            map_key_editor(make_key(KeyCode::PageUp, KeyModifiers::NONE)),
+            KeyAction::EditorPageUp
+        );
+        assert_eq!(
+            map_key_editor(make_key(KeyCode::PageDown, KeyModifiers::NONE)),
+            KeyAction::EditorPageDown
+        );
+        assert_eq!(
+            map_key_editor(make_key(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            KeyAction::EditorSave
+        );
+        assert_eq!(
+            map_key_editor(make_key(KeyCode::Esc, KeyModifiers::NONE)),
+            KeyAction::EditorClose
+        );
+    }
+
+    #[test]
+    fn test_editor_confirm_close_keys() {
+        assert_eq!(
+            map_key_editor_confirm(make_key(KeyCode::Char('y'), KeyModifiers::NONE)),
+            KeyAction::EditorConfirmYes
+        );
+        assert_eq!(
+            map_key_editor_confirm(make_key(KeyCode::Char('n'), KeyModifiers::NONE)),
+            KeyAction::EditorConfirmNo
+        );
+        assert_eq!(
+            map_key_editor_confirm(make_key(KeyCode::Esc, KeyModifiers::NONE)),
+            KeyAction::EditorConfirmNo
         );
     }
 

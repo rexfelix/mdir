@@ -142,6 +142,16 @@ pub fn create_file(parent: &Path, name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 줄 배열을 파일에 저장한다 (LF 개행).
+pub fn save_file(path: &Path, lines: &[String]) -> Result<(), String> {
+    let content = if lines.is_empty() {
+        String::new()
+    } else {
+        lines.join("\n") + "\n"
+    };
+    fs::write(path, content).map_err(|e| format!("저장 실패: {}", e))
+}
+
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     fs::create_dir(dst)
         .map_err(|e| format!("디렉토리 생성 실패 {}: {}", dst.display(), e))?;
@@ -390,6 +400,71 @@ mod tests {
         let result = create_file(dir.path(), "file_a.txt");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("이미 존재"));
+    }
+
+    // --- save_file ---
+
+    #[test]
+    fn test_save_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("output.txt");
+
+        let lines = vec![
+            "first line".to_string(),
+            "second line".to_string(),
+            "third line".to_string(),
+        ];
+        save_file(&path, &lines).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "first line\nsecond line\nthird line\n");
+    }
+
+    #[test]
+    fn test_save_file_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+
+        let lines: Vec<String> = vec![];
+        save_file(&path, &lines).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "");
+    }
+
+    #[test]
+    fn test_save_file_single_empty_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("single.txt");
+
+        let lines = vec!["".to_string()];
+        save_file(&path, &lines).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "\n");
+    }
+
+    #[test]
+    fn test_save_file_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overwrite.txt");
+        fs::write(&path, "old content").unwrap();
+
+        let lines = vec!["new content".to_string()];
+        save_file(&path, &lines).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "new content\n");
+    }
+
+    #[test]
+    fn test_save_file_invalid_path() {
+        let result = save_file(
+            Path::new("/nonexistent/dir/file.txt"),
+            &["test".to_string()],
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("저장 실패"));
     }
 
     #[test]

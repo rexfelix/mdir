@@ -24,6 +24,12 @@ pub fn render(frame: &mut Frame, app: &App) {
         return;
     }
 
+    // 에디터 모드는 전체 화면 사용
+    if app.mode == AppMode::Editor || app.mode == AppMode::EditorConfirmClose {
+        render_editor(frame, app, size);
+        return;
+    }
+
     // 도움말 모드도 전체 화면 사용
     if matches!(app.mode, AppMode::Help { .. }) {
         render_help(frame, app, size);
@@ -166,7 +172,7 @@ fn render_info_bar(frame: &mut Frame, app: &App, area: Rect) {
             None => String::new(),
         };
         format!(
-            " Dir:{} File:{}{} │ ? V F N C M D R K Q",
+            " Dir:{} File:{}{} │ ? V E F N C M D R K Q",
             app.dir_count(),
             app.file_count(),
             disk
@@ -337,6 +343,172 @@ fn render_viewer(frame: &mut Frame, app: &App, area: Rect) {
             frame.render_widget(bar, chunks[1]);
         }
     }
+}
+
+fn render_editor(frame: &mut Frame, app: &App, area: Rect) {
+    let editor = match &app.editor {
+        Some(ed) => ed,
+        None => return,
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    // 타이틀: 파일명 + 수정 표시
+    let modified_mark = if editor.modified { " [*]" } else { "" };
+    let title = format!(" {}{} ", editor.filename, modified_mark);
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .style(Style::default().fg(Color::Green));
+    let inner = block.inner(chunks[0]);
+    frame.render_widget(block, chunks[0]);
+
+    let visible_rows = inner.height as usize;
+    let line_num_width = 5; // "NNNNN "
+    let text_area_width = (inner.width as usize).saturating_sub(line_num_width + 1);
+    let mut lines: Vec<Line> = Vec::new();
+
+    for i in 0..visible_rows {
+        let line_idx = editor.scroll_row + i;
+        if line_idx >= editor.lines.len() {
+            lines.push(Line::from(Span::styled(
+                "~".to_string(),
+                Style::default().fg(Color::DarkGray),
+            )));
+            continue;
+        }
+
+        let line_text = &editor.lines[line_idx];
+        let line_num = format!("{:>4} ", line_idx + 1);
+
+        // 수평 스크롤 적용: 표시 폭 기준으로 잘라내기
+        let display_text = scroll_and_truncate_line(line_text, editor.scroll_col, text_area_width);
+
+        if line_idx == editor.cursor_row {
+            // 커서가 있는 줄: 커서 위치 하이라이트
+            let cursor_display_col = {
+                let prefix: String = line_text.chars().take(editor.cursor_col).collect();
+                UnicodeWidthStr::width(prefix.as_str()).saturating_sub(editor.scroll_col)
+            };
+
+            let (before, cursor_ch, after) = split_at_display_col(&display_text, cursor_display_col);
+
+            let line_num_style = Style::default().fg(Color::Yellow);
+            let text_style = Style::default().fg(Color::White);
+            let cursor_style = Style::default().bg(Color::White).fg(Color::Black);
+
+            lines.push(Line::from(vec![
+                Span::styled(line_num, line_num_style),
+                Span::styled(before, text_style),
+                Span::styled(cursor_ch, cursor_style),
+                Span::styled(after, text_style),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(line_num, Style::default().fg(Color::DarkGray)),
+                Span::styled(display_text, Style::default().fg(Color::White)),
+            ]));
+        }
+    }
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, inner);
+
+    // 하단 상태바
+    if app.mode == AppMode::EditorConfirmClose {
+        let text = " 변경 내용을 저장하지 않고 닫으시겠습니까? (Y/N) ";
+        let bar = Paragraph::new(Line::from(text))
+            .style(Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD));
+        frame.render_widget(bar, chunks[1]);
+    } else {
+        let msg = editor.message.as_deref().unwrap_or("");
+        let msg_part = if msg.is_empty() {
+            String::new()
+        } else {
+            format!(" │ {}", msg)
+        };
+        let text = format!(
+            " L{},{} │ {}/{}{} │ Ctrl+S:저장 Esc:닫기",
+            editor.cursor_row + 1,
+            editor.cursor_col + 1,
+            editor.cursor_row + 1,
+            editor.lines.len(),
+            msg_part
+        );
+        let bar = Paragraph::new(Line::from(text))
+            .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+        frame.render_widget(bar, chunks[1]);
+    }
+}
+
+/// 줄 텍스트를 수평 스크롤 오프셋 적용 후 표시 폭만큼 잘라낸다.
+fn scroll_and_truncate_line(line: &str, scroll_col: usize, max_width: usize) -> String {
+    let mut result = String::new();
+    let mut display_col = 0;
+    let mut visible_width = 0;
+
+    for c in line.chars() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if display_col + cw <= scroll_col {
+            display_col += cw;
+            continue;
+        }
+        if display_col < scroll_col {
+            // 전각 문자가 스크롤 경계에 걸린 경우
+            display_col += cw;
+            continue;
+        }
+        if visible_width + cw > max_width {
+            break;
+        }
+        result.push(c);
+        visible_width += cw;
+        display_col += cw;
+    }
+    result
+}
+
+/// 표시 문자열을 display_col 위치 기준으로 (before, cursor_char, after)로 분리한다.
+fn split_at_display_col(s: &str, target_col: usize) -> (String, String, String) {
+    let mut before = String::new();
+    let mut cursor_ch = String::new();
+    let mut after = String::new();
+    let mut col = 0;
+    let mut phase = 0; // 0=before, 1=cursor, 2=after
+
+    for c in s.chars() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        match phase {
+            0 => {
+                if col == target_col {
+                    cursor_ch.push(c);
+                    phase = 2;
+                } else if col + cw > target_col {
+                    // 전각 문자가 target_col에 걸침
+                    cursor_ch.push(c);
+                    phase = 2;
+                } else {
+                    before.push(c);
+                }
+                col += cw;
+            }
+            _ => {
+                after.push(c);
+            }
+        }
+    }
+
+    if cursor_ch.is_empty() {
+        cursor_ch = " ".to_string(); // EOF 커서
+    }
+
+    (before, cursor_ch, after)
 }
 
 fn render_help(frame: &mut Frame, app: &App, area: Rect) {

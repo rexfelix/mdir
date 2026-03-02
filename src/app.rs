@@ -34,6 +34,8 @@ pub enum AppMode {
     Help {
         scroll: usize,
     },
+    Editor,
+    EditorConfirmClose,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +46,19 @@ pub struct ViewerState {
     pub search_query: Option<String>,
     pub search_matches: Vec<usize>,
     pub current_match: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct EditorState {
+    pub filepath: PathBuf,
+    pub filename: String,
+    pub lines: Vec<String>,
+    pub cursor_row: usize,
+    pub cursor_col: usize,
+    pub scroll_row: usize,
+    pub scroll_col: usize,
+    pub modified: bool,
+    pub message: Option<String>,
 }
 
 pub struct App {
@@ -61,6 +76,7 @@ pub struct App {
     pub mode: AppMode,
     pub selected_indices: HashSet<usize>,
     pub viewer: Option<ViewerState>,
+    pub editor: Option<EditorState>,
     pub search_results: bool,
     search_original_dir: Option<PathBuf>,
     previous_dir: Option<String>,
@@ -83,6 +99,7 @@ impl App {
             mode: AppMode::Normal,
             selected_indices: HashSet::new(),
             viewer: None,
+            editor: None,
             search_results: false,
             search_original_dir: None,
             previous_dir: None,
@@ -135,6 +152,8 @@ impl App {
             AppMode::Confirm { .. } => crate::event::InputMode::Confirm,
             AppMode::Viewer => crate::event::InputMode::Viewer,
             AppMode::ViewerSearch { .. } => crate::event::InputMode::ViewerSearch,
+            AppMode::Editor => crate::event::InputMode::Editor,
+            AppMode::EditorConfirmClose => crate::event::InputMode::EditorConfirmClose,
             AppMode::Help { .. } => crate::event::InputMode::Help,
         }
     }
@@ -146,6 +165,8 @@ impl App {
             AppMode::Confirm { .. } => self.handle_confirm_key(action),
             AppMode::Viewer => self.handle_viewer_key(action),
             AppMode::ViewerSearch { .. } => self.handle_viewer_search_key(action),
+            AppMode::Editor => self.handle_editor_key(action),
+            AppMode::EditorConfirmClose => self.handle_editor_confirm_key(action),
             AppMode::Help { .. } => self.handle_help_key(action),
         }
     }
@@ -177,6 +198,7 @@ impl App {
             KeyAction::Rename => self.start_rename(),
             KeyAction::Mkdir => self.start_mkdir(),
             KeyAction::NewFile => self.start_new_file(),
+            KeyAction::Edit => self.open_editor(),
             KeyAction::View => self.open_viewer(),
             KeyAction::FileSearch => self.start_file_search(),
             KeyAction::Help => self.open_help(),
@@ -936,6 +958,301 @@ impl App {
     pub fn disk_usage(&self) -> Option<(u64, u64, u8)> {
         disk_usage_for_path(&self.current_dir)
     }
+
+    // --- Phase 5: 에디터 ---
+
+    fn open_editor(&mut self) {
+        if let Some(entry) = self.entries.get(self.cursor) {
+            if entry.is_dir() || entry.is_parent {
+                self.error_message = Some("디렉토리는 편집할 수 없습니다".to_string());
+                return;
+            }
+
+            if entry.size > 10 * 1024 * 1024 {
+                self.error_message = Some("파일이 너무 큽니다 (10MB 초과)".to_string());
+                return;
+            }
+
+            match std::fs::read(&entry.path) {
+                Ok(bytes) => {
+                    let check_len = bytes.len().min(512);
+                    if bytes[..check_len].contains(&0) {
+                        self.error_message =
+                            Some("바이너리 파일은 편집할 수 없습니다".to_string());
+                        return;
+                    }
+
+                    let content = String::from_utf8_lossy(&bytes);
+                    let lines: Vec<String> = if content.is_empty() {
+                        vec!["".to_string()]
+                    } else {
+                        content.lines().map(|l| l.to_string()).collect()
+                    };
+
+                    self.editor = Some(EditorState {
+                        filepath: entry.path.clone(),
+                        filename: entry.name.clone(),
+                        lines,
+                        cursor_row: 0,
+                        cursor_col: 0,
+                        scroll_row: 0,
+                        scroll_col: 0,
+                        modified: false,
+                        message: None,
+                    });
+                    self.mode = AppMode::Editor;
+                }
+                Err(e) => {
+                    self.error_message = Some(format!("파일 읽기 실패: {}", e));
+                }
+            }
+        }
+    }
+
+    fn editor_visible_rows(&self) -> usize {
+        self.terminal_height.saturating_sub(4) as usize
+    }
+
+    fn editor_adjust_scroll(&mut self) {
+        if let Some(ed) = &mut self.editor {
+            let visible_rows = self.terminal_height.saturating_sub(4) as usize;
+            let visible_cols = self.terminal_width.saturating_sub(8) as usize;
+
+            if ed.cursor_row < ed.scroll_row {
+                ed.scroll_row = ed.cursor_row;
+            }
+            if visible_rows > 0 && ed.cursor_row >= ed.scroll_row + visible_rows {
+                ed.scroll_row = ed.cursor_row - visible_rows + 1;
+            }
+
+            let cursor_display_col = if ed.cursor_row < ed.lines.len() {
+                let line = &ed.lines[ed.cursor_row];
+                let prefix: String = line.chars().take(ed.cursor_col).collect();
+                unicode_width::UnicodeWidthStr::width(prefix.as_str())
+            } else {
+                0
+            };
+
+            if cursor_display_col < ed.scroll_col {
+                ed.scroll_col = cursor_display_col;
+            }
+            if visible_cols > 0 && cursor_display_col >= ed.scroll_col + visible_cols {
+                ed.scroll_col = cursor_display_col - visible_cols + 1;
+            }
+        }
+    }
+
+    fn handle_editor_key(&mut self, action: KeyAction) {
+        if let Some(ed) = &mut self.editor {
+            ed.message = None;
+        }
+        match action {
+            KeyAction::EditorChar(c) => self.editor_insert_char(c),
+            KeyAction::EditorBackspace => self.editor_backspace(),
+            KeyAction::EditorDelete => self.editor_delete(),
+            KeyAction::EditorEnter => self.editor_enter(),
+            KeyAction::EditorUp => self.editor_move_up(),
+            KeyAction::EditorDown => self.editor_move_down(),
+            KeyAction::EditorLeft => self.editor_move_left(),
+            KeyAction::EditorRight => self.editor_move_right(),
+            KeyAction::EditorHome => self.editor_home(),
+            KeyAction::EditorEnd => self.editor_end(),
+            KeyAction::EditorPageUp => self.editor_page_up(),
+            KeyAction::EditorPageDown => self.editor_page_down(),
+            KeyAction::EditorSave => self.editor_save(),
+            KeyAction::EditorClose => self.editor_close(),
+            _ => {}
+        }
+    }
+
+    fn handle_editor_confirm_key(&mut self, action: KeyAction) {
+        match action {
+            KeyAction::EditorConfirmYes => {
+                self.editor = None;
+                self.mode = AppMode::Normal;
+                self.load_directory();
+            }
+            KeyAction::EditorConfirmNo => {
+                self.mode = AppMode::Editor;
+            }
+            _ => {}
+        }
+    }
+
+    fn editor_insert_char(&mut self, c: char) {
+        if let Some(ed) = &mut self.editor {
+            if ed.cursor_row < ed.lines.len() {
+                let byte_pos = char_to_byte_pos(&ed.lines[ed.cursor_row], ed.cursor_col);
+                ed.lines[ed.cursor_row].insert(byte_pos, c);
+                ed.cursor_col += 1;
+                ed.modified = true;
+            }
+        }
+        self.editor_adjust_scroll();
+    }
+
+    fn editor_backspace(&mut self) {
+        if let Some(ed) = &mut self.editor {
+            if ed.cursor_col > 0 {
+                let byte_pos = char_to_byte_pos(&ed.lines[ed.cursor_row], ed.cursor_col - 1);
+                let ch = ed.lines[ed.cursor_row][byte_pos..].chars().next().unwrap();
+                ed.lines[ed.cursor_row].remove(byte_pos);
+                let _ = ch;
+                ed.cursor_col -= 1;
+                ed.modified = true;
+            } else if ed.cursor_row > 0 {
+                let current_line = ed.lines.remove(ed.cursor_row);
+                ed.cursor_row -= 1;
+                ed.cursor_col = ed.lines[ed.cursor_row].chars().count();
+                ed.lines[ed.cursor_row].push_str(&current_line);
+                ed.modified = true;
+            }
+        }
+        self.editor_adjust_scroll();
+    }
+
+    fn editor_delete(&mut self) {
+        if let Some(ed) = &mut self.editor {
+            let line_len = ed.lines[ed.cursor_row].chars().count();
+            if ed.cursor_col < line_len {
+                let byte_pos = char_to_byte_pos(&ed.lines[ed.cursor_row], ed.cursor_col);
+                ed.lines[ed.cursor_row].remove(byte_pos);
+                ed.modified = true;
+            } else if ed.cursor_row + 1 < ed.lines.len() {
+                let next_line = ed.lines.remove(ed.cursor_row + 1);
+                ed.lines[ed.cursor_row].push_str(&next_line);
+                ed.modified = true;
+            }
+        }
+    }
+
+    fn editor_enter(&mut self) {
+        if let Some(ed) = &mut self.editor {
+            let byte_pos = char_to_byte_pos(&ed.lines[ed.cursor_row], ed.cursor_col);
+            let rest = ed.lines[ed.cursor_row][byte_pos..].to_string();
+            ed.lines[ed.cursor_row].truncate(byte_pos);
+            ed.cursor_row += 1;
+            ed.lines.insert(ed.cursor_row, rest);
+            ed.cursor_col = 0;
+            ed.modified = true;
+        }
+        self.editor_adjust_scroll();
+    }
+
+    fn editor_move_up(&mut self) {
+        if let Some(ed) = &mut self.editor {
+            if ed.cursor_row > 0 {
+                ed.cursor_row -= 1;
+                let line_len = ed.lines[ed.cursor_row].chars().count();
+                if ed.cursor_col > line_len {
+                    ed.cursor_col = line_len;
+                }
+            }
+        }
+        self.editor_adjust_scroll();
+    }
+
+    fn editor_move_down(&mut self) {
+        if let Some(ed) = &mut self.editor {
+            if ed.cursor_row + 1 < ed.lines.len() {
+                ed.cursor_row += 1;
+                let line_len = ed.lines[ed.cursor_row].chars().count();
+                if ed.cursor_col > line_len {
+                    ed.cursor_col = line_len;
+                }
+            }
+        }
+        self.editor_adjust_scroll();
+    }
+
+    fn editor_move_left(&mut self) {
+        if let Some(ed) = &mut self.editor {
+            if ed.cursor_col > 0 {
+                ed.cursor_col -= 1;
+            } else if ed.cursor_row > 0 {
+                ed.cursor_row -= 1;
+                ed.cursor_col = ed.lines[ed.cursor_row].chars().count();
+            }
+        }
+        self.editor_adjust_scroll();
+    }
+
+    fn editor_move_right(&mut self) {
+        if let Some(ed) = &mut self.editor {
+            let line_len = ed.lines[ed.cursor_row].chars().count();
+            if ed.cursor_col < line_len {
+                ed.cursor_col += 1;
+            } else if ed.cursor_row + 1 < ed.lines.len() {
+                ed.cursor_row += 1;
+                ed.cursor_col = 0;
+            }
+        }
+        self.editor_adjust_scroll();
+    }
+
+    fn editor_home(&mut self) {
+        if let Some(ed) = &mut self.editor {
+            ed.cursor_col = 0;
+        }
+        self.editor_adjust_scroll();
+    }
+
+    fn editor_end(&mut self) {
+        if let Some(ed) = &mut self.editor {
+            ed.cursor_col = ed.lines[ed.cursor_row].chars().count();
+        }
+        self.editor_adjust_scroll();
+    }
+
+    fn editor_page_up(&mut self) {
+        let visible = self.editor_visible_rows();
+        if let Some(ed) = &mut self.editor {
+            ed.cursor_row = ed.cursor_row.saturating_sub(visible);
+            let line_len = ed.lines[ed.cursor_row].chars().count();
+            if ed.cursor_col > line_len {
+                ed.cursor_col = line_len;
+            }
+        }
+        self.editor_adjust_scroll();
+    }
+
+    fn editor_page_down(&mut self) {
+        let visible = self.editor_visible_rows();
+        if let Some(ed) = &mut self.editor {
+            ed.cursor_row = (ed.cursor_row + visible).min(ed.lines.len().saturating_sub(1));
+            let line_len = ed.lines[ed.cursor_row].chars().count();
+            if ed.cursor_col > line_len {
+                ed.cursor_col = line_len;
+            }
+        }
+        self.editor_adjust_scroll();
+    }
+
+    fn editor_save(&mut self) {
+        if let Some(ed) = &mut self.editor {
+            match file_ops::save_file(&ed.filepath, &ed.lines) {
+                Ok(()) => {
+                    ed.modified = false;
+                    ed.message = Some("저장 완료".to_string());
+                }
+                Err(e) => {
+                    ed.message = Some(e);
+                }
+            }
+        }
+    }
+
+    fn editor_close(&mut self) {
+        if let Some(ed) = &self.editor {
+            if ed.modified {
+                self.mode = AppMode::EditorConfirmClose;
+            } else {
+                self.editor = None;
+                self.mode = AppMode::Normal;
+                self.load_directory();
+            }
+        }
+    }
 }
 
 pub fn generate_help_lines() -> Vec<String> {
@@ -985,6 +1302,25 @@ pub fn generate_help_lines() -> Vec<String> {
         "      Q / Esc          뷰어 닫기".to_string(),
         "".to_string(),
         "    검색 매치는 노란색으로, 현재 매치는 노란색 반전으로 강조".to_string(),
+        "".to_string(),
+        "".to_string(),
+        "  [내부 에디터]  (E 키로 진입)".to_string(),
+        "".to_string(),
+        "    E                  텍스트 파일 편집 (10MB 이하, 바이너리 제외)".to_string(),
+        "".to_string(),
+        "    에디터 모드 단축키:".to_string(),
+        "      ↑ / ↓            커서 위/아래 이동".to_string(),
+        "      ← / →            커서 좌/우 이동 (줄 경계 시 줄 이동)".to_string(),
+        "      Home / End       줄의 처음/끝으로 이동".to_string(),
+        "      PageUp / PageDown  페이지 단위 이동".to_string(),
+        "      Backspace        커서 앞 문자 삭제 (줄 시작이면 윗줄과 병합)".to_string(),
+        "      Delete           커서 위치 문자 삭제 (줄 끝이면 아랫줄과 병합)".to_string(),
+        "      Enter            현재 위치에서 줄 분할".to_string(),
+        "      Ctrl+S           파일 저장".to_string(),
+        "      Esc              에디터 닫기 (수정 시 저장 확인)".to_string(),
+        "".to_string(),
+        "    * 수정된 파일은 타이틀에 [*] 표시".to_string(),
+        "    * 한글 등 멀티바이트 문자 편집 지원".to_string(),
         "".to_string(),
         "".to_string(),
         "  [파일 검색]  (F 키로 진입)".to_string(),
@@ -2250,7 +2586,359 @@ mod tests {
         assert!(joined.contains("네비게이션"));
         assert!(joined.contains("CRUD"));
         assert!(joined.contains("뷰어"));
+        assert!(joined.contains("에디터"));
         assert!(joined.contains("검색"));
         assert!(joined.contains("입력 모드"));
+    }
+
+    // --- 에디터 테스트 (Phase 5) ---
+
+    /// 테스트용 에디터를 직접 세팅하는 헬퍼.
+    /// 파일 시스템 의존 없이 EditorState를 주입한다.
+    fn setup_editor(app: &mut App, lines: Vec<&str>, filepath: PathBuf) {
+        app.editor = Some(EditorState {
+            filepath,
+            filename: "test.txt".to_string(),
+            lines: lines.into_iter().map(|s| s.to_string()).collect(),
+            cursor_row: 0,
+            cursor_col: 0,
+            scroll_row: 0,
+            scroll_col: 0,
+            modified: false,
+            message: None,
+        });
+        app.mode = AppMode::Editor;
+    }
+
+    #[test]
+    fn test_editor_open_text_file() {
+        let (mut app, _dir) = create_test_app();
+        // file_a.txt 위치 찾기
+        let idx = app.entries.iter().position(|e| e.name == "file_a.txt").unwrap();
+        app.cursor = idx;
+        app.handle_key(KeyAction::Edit);
+        assert_eq!(app.mode, AppMode::Editor);
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.lines, vec!["aaa"]);
+        assert_eq!(ed.cursor_row, 0);
+        assert_eq!(ed.cursor_col, 0);
+        assert!(!ed.modified);
+    }
+
+    #[test]
+    fn test_editor_open_directory_rejected() {
+        let (mut app, _dir) = create_test_app();
+        let idx = app.entries.iter().position(|e| e.name == "alpha_dir").unwrap();
+        app.cursor = idx;
+        app.handle_key(KeyAction::Edit);
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(app.error_message.as_ref().unwrap().contains("디렉토리"));
+    }
+
+    #[test]
+    fn test_editor_open_binary_rejected() {
+        let (mut app, dir) = create_test_app();
+        // 바이너리 파일 생성
+        fs::write(dir.path().join("binary.dat"), &[0u8, 1, 2, 3, 0]).unwrap();
+        app.load_directory();
+        let idx = app.entries.iter().position(|e| e.name == "binary.dat").unwrap();
+        app.cursor = idx;
+        app.handle_key(KeyAction::Edit);
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(app.error_message.as_ref().unwrap().contains("바이너리"));
+    }
+
+    #[test]
+    fn test_editor_insert_char() {
+        let (mut app, dir) = create_test_app();
+        setup_editor(&mut app, vec!["abc"], dir.path().join("t.txt"));
+        app.handle_key(KeyAction::EditorChar('X'));
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.lines[0], "Xabc");
+        assert_eq!(ed.cursor_col, 1);
+        assert!(ed.modified);
+    }
+
+    #[test]
+    fn test_editor_insert_char_middle() {
+        let (mut app, dir) = create_test_app();
+        setup_editor(&mut app, vec!["abc"], dir.path().join("t.txt"));
+        app.editor.as_mut().unwrap().cursor_col = 2;
+        app.handle_key(KeyAction::EditorChar('X'));
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.lines[0], "abXc");
+        assert_eq!(ed.cursor_col, 3);
+    }
+
+    #[test]
+    fn test_editor_insert_multibyte() {
+        let (mut app, dir) = create_test_app();
+        setup_editor(&mut app, vec!["가나다"], dir.path().join("t.txt"));
+        app.editor.as_mut().unwrap().cursor_col = 1; // "가|나다"
+        app.handle_key(KeyAction::EditorChar('X'));
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.lines[0], "가X나다");
+        assert_eq!(ed.cursor_col, 2);
+    }
+
+    #[test]
+    fn test_editor_backspace_within_line() {
+        let (mut app, dir) = create_test_app();
+        setup_editor(&mut app, vec!["abc"], dir.path().join("t.txt"));
+        app.editor.as_mut().unwrap().cursor_col = 2;
+        app.handle_key(KeyAction::EditorBackspace);
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.lines[0], "ac");
+        assert_eq!(ed.cursor_col, 1);
+        assert!(ed.modified);
+    }
+
+    #[test]
+    fn test_editor_backspace_line_merge() {
+        let (mut app, dir) = create_test_app();
+        setup_editor(&mut app, vec!["hello", "world"], dir.path().join("t.txt"));
+        app.editor.as_mut().unwrap().cursor_row = 1;
+        app.editor.as_mut().unwrap().cursor_col = 0;
+        app.handle_key(KeyAction::EditorBackspace);
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.lines.len(), 1);
+        assert_eq!(ed.lines[0], "helloworld");
+        assert_eq!(ed.cursor_row, 0);
+        assert_eq!(ed.cursor_col, 5);
+    }
+
+    #[test]
+    fn test_editor_backspace_at_beginning_noop() {
+        let (mut app, dir) = create_test_app();
+        setup_editor(&mut app, vec!["abc"], dir.path().join("t.txt"));
+        app.handle_key(KeyAction::EditorBackspace);
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.lines[0], "abc");
+        assert!(!ed.modified);
+    }
+
+    #[test]
+    fn test_editor_delete_within_line() {
+        let (mut app, dir) = create_test_app();
+        setup_editor(&mut app, vec!["abc"], dir.path().join("t.txt"));
+        app.handle_key(KeyAction::EditorDelete);
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.lines[0], "bc");
+        assert_eq!(ed.cursor_col, 0);
+        assert!(ed.modified);
+    }
+
+    #[test]
+    fn test_editor_delete_line_merge() {
+        let (mut app, dir) = create_test_app();
+        setup_editor(&mut app, vec!["abc", "def"], dir.path().join("t.txt"));
+        app.editor.as_mut().unwrap().cursor_col = 3; // 줄 끝
+        app.handle_key(KeyAction::EditorDelete);
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.lines.len(), 1);
+        assert_eq!(ed.lines[0], "abcdef");
+    }
+
+    #[test]
+    fn test_editor_enter_splits_line() {
+        let (mut app, dir) = create_test_app();
+        setup_editor(&mut app, vec!["abcdef"], dir.path().join("t.txt"));
+        app.editor.as_mut().unwrap().cursor_col = 3;
+        app.handle_key(KeyAction::EditorEnter);
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.lines.len(), 2);
+        assert_eq!(ed.lines[0], "abc");
+        assert_eq!(ed.lines[1], "def");
+        assert_eq!(ed.cursor_row, 1);
+        assert_eq!(ed.cursor_col, 0);
+        assert!(ed.modified);
+    }
+
+    #[test]
+    fn test_editor_enter_at_beginning() {
+        let (mut app, dir) = create_test_app();
+        setup_editor(&mut app, vec!["abc"], dir.path().join("t.txt"));
+        app.handle_key(KeyAction::EditorEnter);
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.lines.len(), 2);
+        assert_eq!(ed.lines[0], "");
+        assert_eq!(ed.lines[1], "abc");
+        assert_eq!(ed.cursor_row, 1);
+        assert_eq!(ed.cursor_col, 0);
+    }
+
+    #[test]
+    fn test_editor_enter_at_end() {
+        let (mut app, dir) = create_test_app();
+        setup_editor(&mut app, vec!["abc"], dir.path().join("t.txt"));
+        app.editor.as_mut().unwrap().cursor_col = 3;
+        app.handle_key(KeyAction::EditorEnter);
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.lines.len(), 2);
+        assert_eq!(ed.lines[0], "abc");
+        assert_eq!(ed.lines[1], "");
+    }
+
+    #[test]
+    fn test_editor_move_up_down() {
+        let (mut app, dir) = create_test_app();
+        setup_editor(&mut app, vec!["aaa", "bbb", "ccc"], dir.path().join("t.txt"));
+        app.handle_key(KeyAction::EditorDown);
+        assert_eq!(app.editor.as_ref().unwrap().cursor_row, 1);
+        app.handle_key(KeyAction::EditorDown);
+        assert_eq!(app.editor.as_ref().unwrap().cursor_row, 2);
+        // 마지막 줄에서 Down: 변화 없음
+        app.handle_key(KeyAction::EditorDown);
+        assert_eq!(app.editor.as_ref().unwrap().cursor_row, 2);
+        app.handle_key(KeyAction::EditorUp);
+        assert_eq!(app.editor.as_ref().unwrap().cursor_row, 1);
+        app.handle_key(KeyAction::EditorUp);
+        assert_eq!(app.editor.as_ref().unwrap().cursor_row, 0);
+        // 첫 줄에서 Up: 변화 없음
+        app.handle_key(KeyAction::EditorUp);
+        assert_eq!(app.editor.as_ref().unwrap().cursor_row, 0);
+    }
+
+    #[test]
+    fn test_editor_move_up_clamps_col() {
+        let (mut app, dir) = create_test_app();
+        setup_editor(&mut app, vec!["abcdef", "ab"], dir.path().join("t.txt"));
+        app.editor.as_mut().unwrap().cursor_col = 5; // 첫 줄에서 col=5
+        app.handle_key(KeyAction::EditorDown);
+        // 둘째 줄은 2글자뿐이므로 col이 2로 클램프
+        assert_eq!(app.editor.as_ref().unwrap().cursor_col, 2);
+    }
+
+    #[test]
+    fn test_editor_move_left_right() {
+        let (mut app, dir) = create_test_app();
+        setup_editor(&mut app, vec!["abc", "def"], dir.path().join("t.txt"));
+        app.handle_key(KeyAction::EditorRight);
+        assert_eq!(app.editor.as_ref().unwrap().cursor_col, 1);
+        app.handle_key(KeyAction::EditorRight);
+        app.handle_key(KeyAction::EditorRight);
+        assert_eq!(app.editor.as_ref().unwrap().cursor_col, 3); // 줄 끝
+        // Right at end of line → wrap to next line col 0
+        app.handle_key(KeyAction::EditorRight);
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.cursor_row, 1);
+        assert_eq!(ed.cursor_col, 0);
+    }
+
+    #[test]
+    fn test_editor_move_left_wraps_prev_line() {
+        let (mut app, dir) = create_test_app();
+        setup_editor(&mut app, vec!["abc", "def"], dir.path().join("t.txt"));
+        app.editor.as_mut().unwrap().cursor_row = 1;
+        app.editor.as_mut().unwrap().cursor_col = 0;
+        // Left at beginning of line → prev line end
+        app.handle_key(KeyAction::EditorLeft);
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.cursor_row, 0);
+        assert_eq!(ed.cursor_col, 3);
+    }
+
+    #[test]
+    fn test_editor_home_end() {
+        let (mut app, dir) = create_test_app();
+        setup_editor(&mut app, vec!["hello world"], dir.path().join("t.txt"));
+        app.editor.as_mut().unwrap().cursor_col = 5;
+        app.handle_key(KeyAction::EditorHome);
+        assert_eq!(app.editor.as_ref().unwrap().cursor_col, 0);
+        app.handle_key(KeyAction::EditorEnd);
+        assert_eq!(app.editor.as_ref().unwrap().cursor_col, 11);
+    }
+
+    #[test]
+    fn test_editor_page_up_down() {
+        let (mut app, dir) = create_test_app();
+        let lines: Vec<&str> = (0..50).map(|_| "line").collect();
+        setup_editor(&mut app, lines, dir.path().join("t.txt"));
+        app.terminal_height = 24; // visible_rows = 24-4 = 20
+        app.handle_key(KeyAction::EditorPageDown);
+        assert_eq!(app.editor.as_ref().unwrap().cursor_row, 20);
+        app.handle_key(KeyAction::EditorPageDown);
+        assert_eq!(app.editor.as_ref().unwrap().cursor_row, 40);
+        app.handle_key(KeyAction::EditorPageDown);
+        assert_eq!(app.editor.as_ref().unwrap().cursor_row, 49); // clamped
+        app.handle_key(KeyAction::EditorPageUp);
+        assert_eq!(app.editor.as_ref().unwrap().cursor_row, 29);
+        app.handle_key(KeyAction::EditorPageUp);
+        assert_eq!(app.editor.as_ref().unwrap().cursor_row, 9);
+        app.handle_key(KeyAction::EditorPageUp);
+        assert_eq!(app.editor.as_ref().unwrap().cursor_row, 0);
+    }
+
+    #[test]
+    fn test_editor_save() {
+        let (mut app, dir) = create_test_app();
+        let filepath = dir.path().join("save_test.txt");
+        fs::write(&filepath, "original\n").unwrap();
+        setup_editor(&mut app, vec!["modified", "content"], filepath.clone());
+        app.editor.as_mut().unwrap().modified = true;
+        app.handle_key(KeyAction::EditorSave);
+        let ed = app.editor.as_ref().unwrap();
+        assert!(!ed.modified);
+        assert_eq!(ed.message.as_ref().unwrap(), "저장 완료");
+        // 파일 내용 확인
+        let content = fs::read_to_string(&filepath).unwrap();
+        assert_eq!(content, "modified\ncontent\n");
+    }
+
+    #[test]
+    fn test_editor_close_unmodified() {
+        let (mut app, dir) = create_test_app();
+        setup_editor(&mut app, vec!["abc"], dir.path().join("t.txt"));
+        app.handle_key(KeyAction::EditorClose);
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(app.editor.is_none());
+    }
+
+    #[test]
+    fn test_editor_close_modified_asks_confirm() {
+        let (mut app, dir) = create_test_app();
+        setup_editor(&mut app, vec!["abc"], dir.path().join("t.txt"));
+        app.editor.as_mut().unwrap().modified = true;
+        app.handle_key(KeyAction::EditorClose);
+        assert_eq!(app.mode, AppMode::EditorConfirmClose);
+        assert!(app.editor.is_some()); // 아직 열려 있음
+    }
+
+    #[test]
+    fn test_editor_confirm_yes_closes() {
+        let (mut app, dir) = create_test_app();
+        setup_editor(&mut app, vec!["abc"], dir.path().join("t.txt"));
+        app.editor.as_mut().unwrap().modified = true;
+        app.handle_key(KeyAction::EditorClose);
+        assert_eq!(app.mode, AppMode::EditorConfirmClose);
+        app.handle_key(KeyAction::EditorConfirmYes);
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(app.editor.is_none());
+    }
+
+    #[test]
+    fn test_editor_confirm_no_returns_editor() {
+        let (mut app, dir) = create_test_app();
+        setup_editor(&mut app, vec!["abc"], dir.path().join("t.txt"));
+        app.editor.as_mut().unwrap().modified = true;
+        app.handle_key(KeyAction::EditorClose);
+        assert_eq!(app.mode, AppMode::EditorConfirmClose);
+        app.handle_key(KeyAction::EditorConfirmNo);
+        assert_eq!(app.mode, AppMode::Editor);
+        assert!(app.editor.is_some());
+    }
+
+    #[test]
+    fn test_editor_empty_file() {
+        let (mut app, dir) = create_test_app();
+        let filepath = dir.path().join("empty.txt");
+        fs::write(&filepath, "").unwrap();
+        app.load_directory();
+        let idx = app.entries.iter().position(|e| e.name == "empty.txt").unwrap();
+        app.cursor = idx;
+        app.handle_key(KeyAction::Edit);
+        assert_eq!(app.mode, AppMode::Editor);
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.lines, vec![""]);
     }
 }
