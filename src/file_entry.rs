@@ -2,6 +2,7 @@ use chrono::{DateTime, Local};
 use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryType {
@@ -49,7 +50,7 @@ impl FileEntry {
 
         let name = path
             .file_name()
-            .map(|n| n.to_string_lossy().to_string())
+            .map(|n| n.to_string_lossy().nfc().collect::<String>())
             .unwrap_or_default();
 
         Ok(Self {
@@ -376,5 +377,20 @@ mod tests {
             is_parent: false,
         };
         assert!(!entry2.is_symlink());
+    }
+
+    #[test]
+    fn test_nfc_normalization() {
+        // macOS NFD: '공유' = U+1100 U+1169 U+11BC U+110B U+1172 (분해형 Jamo)
+        let nfd_name = "\u{1100}\u{1169}\u{11BC}\u{110B}\u{1172}";
+        // NFC: '공유' = U+ACF5 U+C720 (조합형)
+        let nfc_name = "\u{ACF5}\u{C720}";
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(nfd_name);
+        fs::create_dir(&path).unwrap();
+
+        let entry = FileEntry::from_path(&path).unwrap();
+        assert_eq!(entry.name, nfc_name, "NFD name should be normalized to NFC");
     }
 }

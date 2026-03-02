@@ -4,6 +4,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
+use unicode_normalization::UnicodeNormalization;
+use unicode_width::UnicodeWidthChar;
+use unicode_width::UnicodeWidthStr;
 
 pub fn render(frame: &mut Frame, app: &App) {
     let size = frame.area();
@@ -56,7 +59,8 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
     let title = if app.search_results {
         format!(" 검색 결과: {}개 ", app.entries.len())
     } else {
-        truncate_path(&app.current_dir.to_string_lossy(), area.width as usize - 2)
+        let path_nfc: String = app.current_dir.to_string_lossy().nfc().collect();
+        truncate_path(&path_nfc, area.width as usize - 2)
     };
     if inner_height == 0 || app.entries.is_empty() {
         let block = Block::default()
@@ -497,14 +501,33 @@ fn format_entry_name(entry: &crate::file_entry::FileEntry, max_width: usize, sel
         entry.name.clone()
     };
 
-    let truncated = if name.chars().count() > name_max && name_max > 3 {
-        let prefix: String = name.chars().take(name_max - 3).collect();
+    let name_width = UnicodeWidthStr::width(name.as_str());
+    let truncated = if name_width > name_max && name_max > 3 {
+        let prefix = truncate_to_width(&name, name_max - 3);
         format!("{}...", prefix)
     } else {
         name.clone()
     };
 
-    format!("{}{:<width$} {:>size_w$}", marker, truncated, size_str, width = name_max, size_w = size_col)
+    let truncated_width = UnicodeWidthStr::width(truncated.as_str());
+    let padding = name_max.saturating_sub(truncated_width);
+
+    format!("{}{}{} {:>size_w$}", marker, truncated, " ".repeat(padding), size_str, size_w = size_col)
+}
+
+/// 문자열을 터미널 표시 폭 기준으로 잘라낸다 (CJK 전각 문자 대응)
+fn truncate_to_width(s: &str, max_width: usize) -> String {
+    let mut result = String::new();
+    let mut width = 0;
+    for c in s.chars() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if width + cw > max_width {
+            break;
+        }
+        result.push(c);
+        width += cw;
+    }
+    result
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -520,13 +543,31 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn truncate_path(path: &str, max_len: usize) -> String {
-    if path.len() <= max_len {
+    let path_width = UnicodeWidthStr::width(path);
+    if path_width <= max_len {
         format!(" {} ", path)
     } else if max_len > 6 {
-        format!(" ...{} ", &path[path.len() - (max_len - 4)..])
+        let suffix = truncate_from_end_to_width(path, max_len - 4);
+        format!(" ...{} ", suffix)
     } else {
         " ... ".to_string()
     }
+}
+
+/// 문자열의 끝에서부터 터미널 표시 폭 기준으로 잘라낸다
+fn truncate_from_end_to_width(s: &str, max_width: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut width = 0;
+    let mut start = chars.len();
+    for i in (0..chars.len()).rev() {
+        let cw = UnicodeWidthChar::width(chars[i]).unwrap_or(0);
+        if width + cw > max_width {
+            break;
+        }
+        width += cw;
+        start = i;
+    }
+    chars[start..].iter().collect()
 }
 
 #[cfg(test)]
@@ -616,7 +657,73 @@ mod tests {
         };
         let formatted = format_entry_name(&entry, 20, false);
         assert!(formatted.contains("..."));
-        // panic 없이 정상 실행되면 성공
+        // 표시 폭이 max_width를 초과하지 않아야 한다
+        let display_width = UnicodeWidthStr::width(formatted.as_str());
+        assert!(display_width <= 20, "display width {} > max 20", display_width);
+    }
+
+    #[test]
+    fn test_format_entry_name_cjk_display_width() {
+        use crate::file_entry::{EntryType, FileEntry};
+        use std::path::PathBuf;
+
+        // 한글 2글자 "공유" → 표시 폭 4칸, 문자 수 2개
+        // 표시 폭 기준으로 패딩되어 컬럼 폭을 초과하면 안 된다
+        let entry = FileEntry {
+            name: "공유".to_string(),
+            path: PathBuf::from("공유"),
+            entry_type: EntryType::Directory,
+            size: 0,
+            modified: None,
+            is_parent: false,
+        };
+        let formatted = format_entry_name(&entry, 30, false);
+        let display_width = UnicodeWidthStr::width(formatted.as_str());
+        assert!(display_width <= 30, "CJK display width {} > max 30", display_width);
+        assert!(formatted.contains("공유"));
+    }
+
+    #[test]
+    fn test_truncate_to_width_cjk() {
+        // 한글 "가나다라마" = 표시 폭 10칸
+        // max_width=6이면 "가나다" (6칸)만 남아야 한다
+        let result = truncate_to_width("가나다라마", 6);
+        assert_eq!(result, "가나다");
+        assert_eq!(UnicodeWidthStr::width(result.as_str()), 6);
+    }
+
+    #[test]
+    fn test_truncate_to_width_mixed() {
+        // "abc한글" = 표시 폭 3+4=7칸
+        // max_width=5이면 "abc한" (3+2=5칸)
+        let result = truncate_to_width("abc한글", 5);
+        assert_eq!(result, "abc한");
+        assert_eq!(UnicodeWidthStr::width(result.as_str()), 5);
+    }
+
+    #[test]
+    fn test_truncate_to_width_boundary() {
+        // max_width=5에서 전각 문자가 경계에 걸리면 포함하지 않음
+        // "ab한글" = 2+4=6칸, max_width=5이면 "ab한" (2+2=4칸)
+        let result = truncate_to_width("ab한글", 5);
+        assert_eq!(result, "ab한");
+        assert_eq!(UnicodeWidthStr::width(result.as_str()), 4);
+    }
+
+    #[test]
+    fn test_truncate_from_end_to_width_cjk() {
+        // "/home/공유/문서" 끝에서 6칸 = "/문서" (1+4=5) 또는 "유/문서" (2+1+4=7>6)
+        // 정확히 6칸 이내로 잘라야 한다
+        let result = truncate_from_end_to_width("/home/공유/문서", 6);
+        let w = UnicodeWidthStr::width(result.as_str());
+        assert!(w <= 6, "truncate_from_end width {} > max 6", w);
+    }
+
+    #[test]
+    fn test_truncate_path_cjk() {
+        // 한글 경로가 panic 없이 잘려야 한다
+        let result = truncate_path("/Users/홈/Documents/공유/파일", 20);
+        assert!(result.contains("...") || result.len() <= 24);
     }
 
     // --- Phase 3 테스트 ---
