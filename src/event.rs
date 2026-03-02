@@ -29,6 +29,7 @@ pub enum KeyAction {
     Delete,
     Rename,
     Mkdir,
+    NewFile,
     // 입력 모드 전용
     InputChar(char),
     InputBackspace,
@@ -61,6 +62,15 @@ pub enum KeyAction {
     ViewerSearchBackspace,
     ViewerSearchConfirm,
     ViewerSearchCancel,
+    // 도움말 모드
+    Help,
+    HelpUp,
+    HelpDown,
+    HelpPageUp,
+    HelpPageDown,
+    HelpHome,
+    HelpEnd,
+    HelpClose,
     // 기타
     Quit,
     Noop,
@@ -74,6 +84,7 @@ pub enum InputMode {
     Confirm,
     Viewer,
     ViewerSearch,
+    Help,
 }
 
 pub fn poll_event_with_mode(timeout: Duration, mode: InputMode) -> std::io::Result<AppEvent> {
@@ -86,6 +97,7 @@ pub fn poll_event_with_mode(timeout: Duration, mode: InputMode) -> std::io::Resu
                     InputMode::Confirm => map_key_confirm(key),
                     InputMode::Viewer => map_key_viewer(key),
                     InputMode::ViewerSearch => map_key_viewer_search(key),
+                    InputMode::Help => map_key_help(key),
                 };
                 Ok(AppEvent::Key(action))
             }
@@ -118,8 +130,10 @@ fn map_key_normal(key: KeyEvent) -> KeyAction {
         KeyCode::Char('d') | KeyCode::Char('D') => KeyAction::Delete,
         KeyCode::Char('r') | KeyCode::Char('R') => KeyAction::Rename,
         KeyCode::Char('k') | KeyCode::Char('K') => KeyAction::Mkdir,
+        KeyCode::Char('n') | KeyCode::Char('N') => KeyAction::NewFile,
         KeyCode::Char('v') | KeyCode::Char('V') => KeyAction::View,
         KeyCode::Char('f') | KeyCode::Char('F') => KeyAction::FileSearch,
+        KeyCode::Char('?') => KeyAction::Help,
         KeyCode::F(10) => KeyAction::Quit,
         _ => KeyAction::Noop,
     }
@@ -162,6 +176,21 @@ fn map_key_viewer_search(key: KeyEvent) -> KeyAction {
         KeyCode::Esc => KeyAction::ViewerSearchCancel,
         KeyCode::Backspace => KeyAction::ViewerSearchBackspace,
         KeyCode::Char(c) => KeyAction::ViewerSearchChar(c),
+        _ => KeyAction::Noop,
+    }
+}
+
+fn map_key_help(key: KeyEvent) -> KeyAction {
+    match key.code {
+        KeyCode::Up => KeyAction::HelpUp,
+        KeyCode::Down => KeyAction::HelpDown,
+        KeyCode::PageUp => KeyAction::HelpPageUp,
+        KeyCode::PageDown => KeyAction::HelpPageDown,
+        KeyCode::Home => KeyAction::HelpHome,
+        KeyCode::End => KeyAction::HelpEnd,
+        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc | KeyCode::Char('?') => {
+            KeyAction::HelpClose
+        }
         _ => KeyAction::Noop,
     }
 }
@@ -303,6 +332,10 @@ mod tests {
         assert_eq!(
             map_key_normal(make_key(KeyCode::Char('k'), KeyModifiers::NONE)),
             KeyAction::Mkdir
+        );
+        assert_eq!(
+            map_key_normal(make_key(KeyCode::Char('n'), KeyModifiers::NONE)),
+            KeyAction::NewFile
         );
     }
 
@@ -449,6 +482,54 @@ mod tests {
         assert_eq!(
             map_key_viewer_search(make_key(KeyCode::Esc, KeyModifiers::NONE)),
             KeyAction::ViewerSearchCancel
+        );
+    }
+
+    #[test]
+    fn test_help_key() {
+        assert_eq!(
+            map_key_normal(make_key(KeyCode::Char('?'), KeyModifiers::NONE)),
+            KeyAction::Help
+        );
+    }
+
+    #[test]
+    fn test_help_mode_keys() {
+        assert_eq!(
+            map_key_help(make_key(KeyCode::Up, KeyModifiers::NONE)),
+            KeyAction::HelpUp
+        );
+        assert_eq!(
+            map_key_help(make_key(KeyCode::Down, KeyModifiers::NONE)),
+            KeyAction::HelpDown
+        );
+        assert_eq!(
+            map_key_help(make_key(KeyCode::PageUp, KeyModifiers::NONE)),
+            KeyAction::HelpPageUp
+        );
+        assert_eq!(
+            map_key_help(make_key(KeyCode::PageDown, KeyModifiers::NONE)),
+            KeyAction::HelpPageDown
+        );
+        assert_eq!(
+            map_key_help(make_key(KeyCode::Home, KeyModifiers::NONE)),
+            KeyAction::HelpHome
+        );
+        assert_eq!(
+            map_key_help(make_key(KeyCode::End, KeyModifiers::NONE)),
+            KeyAction::HelpEnd
+        );
+        assert_eq!(
+            map_key_help(make_key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            KeyAction::HelpClose
+        );
+        assert_eq!(
+            map_key_help(make_key(KeyCode::Esc, KeyModifiers::NONE)),
+            KeyAction::HelpClose
+        );
+        assert_eq!(
+            map_key_help(make_key(KeyCode::Char('?'), KeyModifiers::NONE)),
+            KeyAction::HelpClose
         );
     }
 

@@ -123,6 +123,25 @@ pub fn create_directory(parent: &Path, name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 새 빈 파일을 생성한다.
+pub fn create_file(parent: &Path, name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("파일명이 비어있습니다".to_string());
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err("이름에 경로 구분자를 포함할 수 없습니다".to_string());
+    }
+
+    let target = parent.join(name);
+    if target.exists() {
+        return Err(format!("이미 존재합니다: {}", name));
+    }
+
+    fs::File::create(&target)
+        .map_err(|e| format!("파일 생성 실패: {}", e))?;
+    Ok(())
+}
+
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     fs::create_dir(dst)
         .map_err(|e| format!("디렉토리 생성 실패 {}: {}", dst.display(), e))?;
@@ -347,6 +366,28 @@ mod tests {
     fn test_create_directory_duplicate_error() {
         let dir = setup_test_dir();
         let result = create_directory(dir.path(), "sub_dir");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("이미 존재"));
+    }
+
+    #[test]
+    fn test_create_file() {
+        let dir = setup_test_dir();
+        create_file(dir.path(), "new_file.txt").unwrap();
+        assert!(dir.path().join("new_file.txt").is_file());
+    }
+
+    #[test]
+    fn test_create_file_empty_name_error() {
+        let dir = setup_test_dir();
+        let result = create_file(dir.path(), "");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_file_duplicate_error() {
+        let dir = setup_test_dir();
+        let result = create_file(dir.path(), "file_a.txt");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("이미 존재"));
     }

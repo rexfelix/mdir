@@ -21,6 +21,12 @@ pub fn render(frame: &mut Frame, app: &App) {
         return;
     }
 
+    // 도움말 모드도 전체 화면 사용
+    if matches!(app.mode, AppMode::Help { .. }) {
+        render_help(frame, app, size);
+        return;
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -156,7 +162,7 @@ fn render_info_bar(frame: &mut Frame, app: &App, area: Rect) {
             None => String::new(),
         };
         format!(
-            " Dir:{} File:{}{} │ V F C M D R K Q",
+            " Dir:{} File:{}{} │ ? V F N C M D R K Q",
             app.dir_count(),
             app.file_count(),
             disk
@@ -175,16 +181,18 @@ fn render_info_bar(frame: &mut Frame, app: &App, area: Rect) {
 
 fn render_input_bar(frame: &mut Frame, prompt: &str, buffer: &str, cursor_pos: usize, area: Rect) {
     let prefix = format!(" {} ", prompt);
-    let before = &buffer[..cursor_pos];
-    let cursor_char = if cursor_pos < buffer.len() {
-        &buffer[cursor_pos..cursor_pos + 1]
+    // cursor_pos는 char 단위이므로 char 기반으로 분할
+    let char_count = buffer.chars().count();
+    let before: String = buffer.chars().take(cursor_pos).collect();
+    let cursor_char: String = if cursor_pos < char_count {
+        buffer.chars().nth(cursor_pos).map(|c| c.to_string()).unwrap_or_else(|| " ".to_string())
     } else {
-        " "
+        " ".to_string()
     };
-    let after = if cursor_pos < buffer.len() {
-        &buffer[cursor_pos + 1..]
+    let after: String = if cursor_pos < char_count {
+        buffer.chars().skip(cursor_pos + 1).collect()
     } else {
-        ""
+        String::new()
     };
 
     let base_style = Style::default().bg(Color::Blue).fg(Color::White);
@@ -192,9 +200,9 @@ fn render_input_bar(frame: &mut Frame, prompt: &str, buffer: &str, cursor_pos: u
 
     let line = Line::from(vec![
         Span::styled(prefix, base_style),
-        Span::styled(before.to_string(), base_style),
-        Span::styled(cursor_char.to_string(), cursor_style),
-        Span::styled(after.to_string(), base_style),
+        Span::styled(before, base_style),
+        Span::styled(cursor_char, cursor_style),
+        Span::styled(after, base_style),
     ]);
     let bar = Paragraph::new(line).style(base_style);
     frame.render_widget(bar, area);
@@ -327,6 +335,149 @@ fn render_viewer(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+fn render_help(frame: &mut Frame, app: &App, area: Rect) {
+    let scroll = if let AppMode::Help { scroll } = &app.mode {
+        *scroll
+    } else {
+        return;
+    };
+
+    let help_lines = crate::app::generate_help_lines();
+    let total = help_lines.len();
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    let block = Block::default()
+        .title(" mdir 도움말 ")
+        .borders(Borders::ALL)
+        .style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(chunks[0]);
+    frame.render_widget(block, chunks[0]);
+
+    let visible_height = inner.height as usize;
+    let mut lines: Vec<Line> = Vec::new();
+
+    for i in 0..visible_height {
+        let line_idx = scroll + i;
+        if line_idx >= total {
+            lines.push(Line::from(""));
+            continue;
+        }
+
+        let text = &help_lines[line_idx];
+
+        // 섹션 제목: [대괄호]로 시작하는 줄
+        if text.trim_start().starts_with('[') && text.contains(']') {
+            lines.push(Line::from(Span::styled(
+                text.to_string(),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )));
+        }
+        // 박스 테두리 줄
+        else if text.contains('╔') || text.contains('╚') || text.contains('║') {
+            lines.push(Line::from(Span::styled(
+                text.to_string(),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        // 키 설명 줄: 4칸 이상 들여쓰기 + 영문/기호로 시작
+        else if text.starts_with("    ") && !text.trim().is_empty() {
+            let trimmed = &text[4..];
+            // 키 부분과 설명 부분 분리: 첫 번째 공백 여러 개가 나오는 지점
+            if let Some(sep_pos) = find_key_desc_separator(trimmed) {
+                let key_part = &text[..4 + sep_pos];
+                let desc_part = &text[4 + sep_pos..];
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        key_part.to_string(),
+                        Style::default().fg(Color::Green),
+                    ),
+                    Span::styled(
+                        desc_part.to_string(),
+                        Style::default().fg(Color::White),
+                    ),
+                ]));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    text.to_string(),
+                    Style::default().fg(Color::Green),
+                )));
+            }
+        }
+        // * 참고 줄
+        else if text.trim_start().starts_with('*') {
+            lines.push(Line::from(Span::styled(
+                text.to_string(),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        // 기타 줄 (빈 줄 포함)
+        else {
+            lines.push(Line::from(Span::styled(
+                text.to_string(),
+                Style::default().fg(Color::White),
+            )));
+        }
+    }
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, inner);
+
+    // 하단바
+    let percent = if total == 0 {
+        0
+    } else {
+        (scroll * 100) / total.max(1)
+    };
+    let text = format!(
+        " {}/{} ({}%) │ ↑↓ PgUp/Dn │ Q/Esc/? 닫기",
+        scroll + 1,
+        total,
+        percent
+    );
+    let bar = Paragraph::new(Line::from(text))
+        .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+    frame.render_widget(bar, chunks[1]);
+}
+
+/// 키 이름과 설명 사이의 구분 위치를 찾는다.
+/// "↑ / ↓              커서를..." 에서 연속 공백 2개 이상이 나오는 첫 위치를 반환.
+fn find_key_desc_separator(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    // 먼저 비공백 문자를 건너뛴다 (키 이름 부분)
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+    while i < bytes.len() && bytes[i] != b' ' {
+        i += 1;
+    }
+    // 이후 연속 공백 2개 이상을 찾는다
+    let mut space_start = i;
+    let mut space_count = 0;
+    while i < bytes.len() {
+        if bytes[i] == b' ' {
+            if space_count == 0 {
+                space_start = i;
+            }
+            space_count += 1;
+        } else {
+            if space_count >= 2 {
+                return Some(space_start);
+            }
+            space_count = 0;
+        }
+        i += 1;
+    }
+    None
+}
+
 fn render_confirm_bar(frame: &mut Frame, message: &str, area: Rect) {
     let text = format!(" {}", message);
     let bar = Paragraph::new(Line::from(text))
@@ -346,8 +497,9 @@ fn format_entry_name(entry: &crate::file_entry::FileEntry, max_width: usize, sel
         entry.name.clone()
     };
 
-    let truncated = if name.len() > name_max && name_max > 3 {
-        format!("{}...", &name[..name_max - 3])
+    let truncated = if name.chars().count() > name_max && name_max > 3 {
+        let prefix: String = name.chars().take(name_max - 3).collect();
+        format!("{}...", prefix)
     } else {
         name.clone()
     };
@@ -446,6 +598,25 @@ mod tests {
         };
         let formatted = format_entry_name(&entry, 25, false);
         assert!(formatted.contains("..."));
+    }
+
+    #[test]
+    fn test_format_entry_name_multibyte_truncation() {
+        use crate::file_entry::{EntryType, FileEntry};
+        use std::path::PathBuf;
+
+        // 한글 파일명이 절삭되어도 panic 없이 동작해야 한다
+        let entry = FileEntry {
+            name: "한글파일이름이_매우_긴_경우입니다.txt".to_string(),
+            path: PathBuf::from("한글파일이름이_매우_긴_경우입니다.txt"),
+            entry_type: EntryType::File,
+            size: 100,
+            modified: None,
+            is_parent: false,
+        };
+        let formatted = format_entry_name(&entry, 20, false);
+        assert!(formatted.contains("..."));
+        // panic 없이 정상 실행되면 성공
     }
 
     // --- Phase 3 테스트 ---

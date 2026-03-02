@@ -10,6 +10,7 @@ pub enum InputPurpose {
     Move,
     Rename,
     Mkdir,
+    NewFile,
     FileSearch,
 }
 
@@ -29,6 +30,9 @@ pub enum AppMode {
     ViewerSearch {
         buffer: String,
         cursor_pos: usize,
+    },
+    Help {
+        scroll: usize,
     },
 }
 
@@ -131,6 +135,7 @@ impl App {
             AppMode::Confirm { .. } => crate::event::InputMode::Confirm,
             AppMode::Viewer => crate::event::InputMode::Viewer,
             AppMode::ViewerSearch { .. } => crate::event::InputMode::ViewerSearch,
+            AppMode::Help { .. } => crate::event::InputMode::Help,
         }
     }
 
@@ -141,6 +146,7 @@ impl App {
             AppMode::Confirm { .. } => self.handle_confirm_key(action),
             AppMode::Viewer => self.handle_viewer_key(action),
             AppMode::ViewerSearch { .. } => self.handle_viewer_search_key(action),
+            AppMode::Help { .. } => self.handle_help_key(action),
         }
     }
 
@@ -170,8 +176,10 @@ impl App {
             KeyAction::Delete => self.start_delete(),
             KeyAction::Rename => self.start_rename(),
             KeyAction::Mkdir => self.start_mkdir(),
+            KeyAction::NewFile => self.start_new_file(),
             KeyAction::View => self.open_viewer(),
             KeyAction::FileSearch => self.start_file_search(),
+            KeyAction::Help => self.open_help(),
             KeyAction::Quit => self.should_quit = true,
             KeyAction::Noop => {}
             // 입력/확인 모드 키는 Normal에서 무시
@@ -183,22 +191,28 @@ impl App {
         match action {
             KeyAction::InputChar(c) => {
                 if let AppMode::Input { buffer, cursor_pos, .. } = &mut self.mode {
-                    buffer.insert(*cursor_pos, c);
+                    let byte_pos = char_to_byte_pos(buffer, *cursor_pos);
+                    buffer.insert(byte_pos, c);
                     *cursor_pos += 1;
                 }
             }
             KeyAction::InputBackspace => {
                 if let AppMode::Input { buffer, cursor_pos, .. } = &mut self.mode {
                     if *cursor_pos > 0 {
-                        buffer.remove(*cursor_pos - 1);
+                        let prev_byte = char_to_byte_pos(buffer, *cursor_pos - 1);
+                        let curr_byte = char_to_byte_pos(buffer, *cursor_pos);
+                        buffer.drain(prev_byte..curr_byte);
                         *cursor_pos -= 1;
                     }
                 }
             }
             KeyAction::InputDelete => {
                 if let AppMode::Input { buffer, cursor_pos, .. } = &mut self.mode {
-                    if *cursor_pos < buffer.len() {
-                        buffer.remove(*cursor_pos);
+                    let char_count = buffer.chars().count();
+                    if *cursor_pos < char_count {
+                        let curr_byte = char_to_byte_pos(buffer, *cursor_pos);
+                        let next_byte = char_to_byte_pos(buffer, *cursor_pos + 1);
+                        buffer.drain(curr_byte..next_byte);
                     }
                 }
             }
@@ -211,7 +225,7 @@ impl App {
             }
             KeyAction::InputCursorRight => {
                 if let AppMode::Input { buffer, cursor_pos, .. } = &mut self.mode {
-                    if *cursor_pos < buffer.len() {
+                    if *cursor_pos < buffer.chars().count() {
                         *cursor_pos += 1;
                     }
                 }
@@ -223,7 +237,7 @@ impl App {
             }
             KeyAction::InputCursorEnd => {
                 if let AppMode::Input { buffer, cursor_pos, .. } = &mut self.mode {
-                    *cursor_pos = buffer.len();
+                    *cursor_pos = buffer.chars().count();
                 }
             }
             KeyAction::InputConfirm => self.execute_input(),
@@ -420,7 +434,7 @@ impl App {
             return;
         }
         let default = self.current_dir.to_string_lossy().to_string();
-        let len = default.len();
+        let len = default.chars().count();
         self.mode = AppMode::Input {
             purpose: InputPurpose::Copy,
             buffer: default,
@@ -435,7 +449,7 @@ impl App {
             return;
         }
         let default = self.current_dir.to_string_lossy().to_string();
-        let len = default.len();
+        let len = default.chars().count();
         self.mode = AppMode::Input {
             purpose: InputPurpose::Move,
             buffer: default,
@@ -478,7 +492,7 @@ impl App {
                 self.error_message = Some("'..'은 이름 변경할 수 없습니다".to_string());
                 return;
             }
-            let len = entry.name.len();
+            let len = entry.name.chars().count();
             self.mode = AppMode::Input {
                 purpose: InputPurpose::Rename,
                 buffer: entry.name.clone(),
@@ -493,6 +507,15 @@ impl App {
             purpose: InputPurpose::Mkdir,
             buffer: String::new(),
             prompt: "새 디렉토리명:".to_string(),
+            cursor_pos: 0,
+        };
+    }
+
+    fn start_new_file(&mut self) {
+        self.mode = AppMode::Input {
+            purpose: InputPurpose::NewFile,
+            buffer: String::new(),
+            prompt: "새 파일명:".to_string(),
             cursor_pos: 0,
         };
     }
@@ -514,6 +537,7 @@ impl App {
                 InputPurpose::Move => self.exec_move(&buffer),
                 InputPurpose::Rename => self.exec_rename(&buffer),
                 InputPurpose::Mkdir => self.exec_mkdir(&buffer),
+                InputPurpose::NewFile => self.exec_new_file(&buffer),
                 InputPurpose::FileSearch => unreachable!(),
             };
             self.mode = AppMode::Normal;
@@ -550,6 +574,10 @@ impl App {
 
     fn exec_mkdir(&self, name: &str) -> Result<(), String> {
         file_ops::create_directory(&self.current_dir, name)
+    }
+
+    fn exec_new_file(&self, name: &str) -> Result<(), String> {
+        file_ops::create_file(&self.current_dir, name)
     }
 
     fn execute_delete(&mut self) {
@@ -697,14 +725,17 @@ impl App {
         match action {
             KeyAction::ViewerSearchChar(c) => {
                 if let AppMode::ViewerSearch { buffer, cursor_pos } = &mut self.mode {
-                    buffer.insert(*cursor_pos, c);
+                    let byte_pos = char_to_byte_pos(buffer, *cursor_pos);
+                    buffer.insert(byte_pos, c);
                     *cursor_pos += 1;
                 }
             }
             KeyAction::ViewerSearchBackspace => {
                 if let AppMode::ViewerSearch { buffer, cursor_pos } = &mut self.mode {
                     if *cursor_pos > 0 {
-                        buffer.remove(*cursor_pos - 1);
+                        let prev_byte = char_to_byte_pos(buffer, *cursor_pos - 1);
+                        let curr_byte = char_to_byte_pos(buffer, *cursor_pos);
+                        buffer.drain(prev_byte..curr_byte);
                         *cursor_pos -= 1;
                     }
                 }
@@ -817,6 +848,60 @@ impl App {
         }
     }
 
+    // --- 도움말 ---
+
+    fn open_help(&mut self) {
+        self.mode = AppMode::Help { scroll: 0 };
+    }
+
+    fn help_visible_lines(&self) -> usize {
+        self.terminal_height.saturating_sub(4) as usize
+    }
+
+    fn handle_help_key(&mut self, action: KeyAction) {
+        let total = generate_help_lines().len();
+        let visible = self.help_visible_lines();
+        match action {
+            KeyAction::HelpUp => {
+                if let AppMode::Help { scroll } = &mut self.mode {
+                    *scroll = scroll.saturating_sub(1);
+                }
+            }
+            KeyAction::HelpDown => {
+                if let AppMode::Help { scroll } = &mut self.mode {
+                    if *scroll + visible < total {
+                        *scroll += 1;
+                    }
+                }
+            }
+            KeyAction::HelpPageUp => {
+                if let AppMode::Help { scroll } = &mut self.mode {
+                    *scroll = scroll.saturating_sub(visible);
+                }
+            }
+            KeyAction::HelpPageDown => {
+                if let AppMode::Help { scroll } = &mut self.mode {
+                    let max_scroll = total.saturating_sub(visible);
+                    *scroll = (*scroll + visible).min(max_scroll);
+                }
+            }
+            KeyAction::HelpHome => {
+                if let AppMode::Help { scroll } = &mut self.mode {
+                    *scroll = 0;
+                }
+            }
+            KeyAction::HelpEnd => {
+                if let AppMode::Help { scroll } = &mut self.mode {
+                    *scroll = total.saturating_sub(visible);
+                }
+            }
+            KeyAction::HelpClose => {
+                self.mode = AppMode::Normal;
+            }
+            _ => {}
+        }
+    }
+
     // --- 유틸 ---
 
     fn clamp_cursor(&mut self) {
@@ -851,6 +936,120 @@ impl App {
     pub fn disk_usage(&self) -> Option<(u64, u64, u8)> {
         disk_usage_for_path(&self.current_dir)
     }
+}
+
+pub fn generate_help_lines() -> Vec<String> {
+    vec![
+        "".to_string(),
+        "  ╔══════════════════════════════════════════════════════════════╗".to_string(),
+        "  ║              mdir 도움말  (MS-DOS Mdir 3.x 클론)           ║".to_string(),
+        "  ╚══════════════════════════════════════════════════════════════╝".to_string(),
+        "".to_string(),
+        "".to_string(),
+        "  [네비게이션]".to_string(),
+        "".to_string(),
+        "    ↑ / ↓              커서를 위/아래로 이동".to_string(),
+        "    ← / →              컬럼 간 이동 (멀티 컬럼 모드에서)".to_string(),
+        "    Enter              디렉토리 진입".to_string(),
+        "    Backspace          상위 디렉토리로 이동".to_string(),
+        "    Home / End         목록의 처음/끝으로 이동".to_string(),
+        "    PageUp / PageDown  페이지 단위로 이동".to_string(),
+        "".to_string(),
+        "".to_string(),
+        "  [파일 선택 및 CRUD]".to_string(),
+        "".to_string(),
+        "    Space              파일/디렉토리 선택 토글 (복수 선택 가능)".to_string(),
+        "    C                  선택한 항목을 다른 경로로 복사".to_string(),
+        "                       (선택 없으면 커서 위치 항목)".to_string(),
+        "    M                  선택한 항목을 다른 경로로 이동".to_string(),
+        "                       (선택 없으면 커서 위치 항목)".to_string(),
+        "    D                  선택한 항목 삭제 (Y/N 확인 후 실행)".to_string(),
+        "                       (선택 없으면 커서 위치 항목)".to_string(),
+        "    R                  커서 위치 파일/디렉토리 이름 변경".to_string(),
+        "    K                  현재 디렉토리에 새 폴더 생성".to_string(),
+        "    N                  현재 디렉토리에 새 빈 파일 생성".to_string(),
+        "".to_string(),
+        "".to_string(),
+        "  [내부 뷰어]  (V 키로 진입)".to_string(),
+        "".to_string(),
+        "    V                  텍스트 파일 내용 보기 (10MB 이하만 가능)".to_string(),
+        "                       바이너리 파일은 자동 감지되어 열리지 않음".to_string(),
+        "".to_string(),
+        "    뷰어 모드 단축키:".to_string(),
+        "      ↑ / ↓            한 줄 스크롤".to_string(),
+        "      PageUp / PageDown  페이지 단위 스크롤".to_string(),
+        "      Home / End       파일 처음/끝으로 이동".to_string(),
+        "      /                텍스트 검색 (검색어 입력 후 Enter)".to_string(),
+        "      n                다음 검색 매치로 이동".to_string(),
+        "      N                이전 검색 매치로 이동".to_string(),
+        "      Q / Esc          뷰어 닫기".to_string(),
+        "".to_string(),
+        "    검색 매치는 노란색으로, 현재 매치는 노란색 반전으로 강조".to_string(),
+        "".to_string(),
+        "".to_string(),
+        "  [파일 검색]  (F 키로 진입)".to_string(),
+        "".to_string(),
+        "    F                  현재 디렉토리 하위 재귀 검색".to_string(),
+        "                       패턴을 입력하면 하위 모든 파일을 탐색".to_string(),
+        "".to_string(),
+        "    패턴 예시:".to_string(),
+        "      *.rs             모든 Rust 소스 파일".to_string(),
+        "      test*            \"test\"로 시작하는 파일".to_string(),
+        "      *.tar.gz         모든 tar.gz 압축 파일".to_string(),
+        "      README?          README + 임의 한 글자".to_string(),
+        "      config           \"config\" 포함 파일 (부분 일치)".to_string(),
+        "".to_string(),
+        "    검색 결과에서:".to_string(),
+        "      Enter            해당 파일이 있는 디렉토리로 이동".to_string(),
+        "      Backspace        원래 위치로 복귀".to_string(),
+        "".to_string(),
+        "    * 패턴은 대소문자를 구분하지 않음".to_string(),
+        "    * 와일드카드 없이 입력하면 부분 일치로 검색".to_string(),
+        "".to_string(),
+        "".to_string(),
+        "  [입력 모드]  (이름변경, 폴더/파일 생성, 복사/이동 경로 입력 시)".to_string(),
+        "".to_string(),
+        "    ← / →              커서 좌/우 이동".to_string(),
+        "    Home / End         입력 시작/끝으로 이동".to_string(),
+        "    Delete             커서 위치 문자 삭제".to_string(),
+        "    Backspace          커서 앞 문자 삭제".to_string(),
+        "    Enter              입력 확인".to_string(),
+        "    Esc                입력 취소".to_string(),
+        "".to_string(),
+        "".to_string(),
+        "  [표시 설정]".to_string(),
+        "".to_string(),
+        "    H                  숨김 파일(. 시작) 표시/숨김 토글".to_string(),
+        "".to_string(),
+        "".to_string(),
+        "  [컬럼 레이아웃]".to_string(),
+        "".to_string(),
+        "    터미널 너비  80 미만    →  1컬럼".to_string(),
+        "    터미널 너비  80~119     →  2컬럼".to_string(),
+        "    터미널 너비 120 이상    →  3컬럼".to_string(),
+        "".to_string(),
+        "".to_string(),
+        "  [파일 타입별 색상]".to_string(),
+        "".to_string(),
+        "    디렉토리             하늘색 (굵게)".to_string(),
+        "    심볼릭 링크          보라색".to_string(),
+        "    압축 파일            노란색  (.tar.gz, .zip, .rar, .7z 등)".to_string(),
+        "    실행 파일            녹색".to_string(),
+        "    일반 파일            흰색".to_string(),
+        "".to_string(),
+        "    * 스타일 우선순위: 커서(흰 배경) > 선택(노란색) > 타입별 색상".to_string(),
+        "".to_string(),
+        "".to_string(),
+        "  [기타]".to_string(),
+        "".to_string(),
+        "    ?                  이 도움말 표시".to_string(),
+        "    Q / F10            프로그램 종료".to_string(),
+        "    Ctrl+C             프로그램 종료".to_string(),
+        "".to_string(),
+        "".to_string(),
+        "  Q, Esc, ? 키를 누르면 도움말을 닫습니다.".to_string(),
+        "".to_string(),
+    ]
 }
 
 #[cfg(unix)]
@@ -932,6 +1131,15 @@ fn search_files_inner(
             search_files_inner(&path, pattern, max_results, results);
         }
     }
+}
+
+/// char 인덱스를 byte 인덱스로 변환한다.
+/// cursor_pos 등 char 단위 위치를 String의 byte 위치로 변환할 때 사용.
+fn char_to_byte_pos(s: &str, char_pos: usize) -> usize {
+    s.char_indices()
+        .nth(char_pos)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
 }
 
 /// 간단한 glob 매칭: * = 임의 문자열, ? = 임의 한 문자, 대소문자 무시.
@@ -1382,6 +1590,32 @@ mod tests {
     }
 
     #[test]
+    fn test_start_new_file_enters_input_mode() {
+        let (mut app, _) = create_test_app();
+        app.handle_key(KeyAction::NewFile);
+        match &app.mode {
+            AppMode::Input { purpose, buffer, cursor_pos, .. } => {
+                assert_eq!(*purpose, InputPurpose::NewFile);
+                assert!(buffer.is_empty());
+                assert_eq!(*cursor_pos, 0);
+            }
+            _ => panic!("NewFile 키로 Input 모드 진입 실패"),
+        }
+    }
+
+    #[test]
+    fn test_new_file_execute() {
+        let (mut app, _dir) = create_test_app();
+        app.handle_key(KeyAction::NewFile);
+        for c in "test_new.txt".chars() {
+            app.handle_key(KeyAction::InputChar(c));
+        }
+        app.handle_key(KeyAction::InputConfirm);
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(app.current_dir.join("test_new.txt").is_file());
+    }
+
+    #[test]
     fn test_input_char_and_backspace() {
         let (mut app, _dir) = create_test_app();
         app.handle_key(KeyAction::Mkdir);
@@ -1451,7 +1685,7 @@ mod tests {
         // End로 끝으로
         app.handle_key(KeyAction::InputCursorEnd);
         if let AppMode::Input { buffer, cursor_pos, .. } = &app.mode {
-            assert_eq!(*cursor_pos, buffer.len());
+            assert_eq!(*cursor_pos, buffer.chars().count());
         }
     }
 
@@ -1878,5 +2112,145 @@ mod tests {
         assert!(super::glob_match("*", "anything"));
         assert!(super::glob_match("file", "file_a.txt")); // contains match
         assert!(super::glob_match("FILE", "file_a.txt")); // case insensitive
+    }
+
+    #[test]
+    fn test_char_to_byte_pos() {
+        assert_eq!(super::char_to_byte_pos("hello", 0), 0);
+        assert_eq!(super::char_to_byte_pos("hello", 3), 3);
+        assert_eq!(super::char_to_byte_pos("hello", 5), 5);
+        // 한글: 각 문자 3바이트
+        assert_eq!(super::char_to_byte_pos("한글테스트", 0), 0);
+        assert_eq!(super::char_to_byte_pos("한글테스트", 1), 3);
+        assert_eq!(super::char_to_byte_pos("한글테스트", 2), 6);
+        assert_eq!(super::char_to_byte_pos("한글테스트", 5), 15);
+        // 혼합
+        assert_eq!(super::char_to_byte_pos("a한b", 0), 0);
+        assert_eq!(super::char_to_byte_pos("a한b", 1), 1);
+        assert_eq!(super::char_to_byte_pos("a한b", 2), 4);
+        assert_eq!(super::char_to_byte_pos("a한b", 3), 5);
+        // 범위 초과 시 len 반환
+        assert_eq!(super::char_to_byte_pos("abc", 10), 3);
+    }
+
+    #[test]
+    fn test_multibyte_input_cursor() {
+        let (mut app, _dir) = create_test_app();
+        app.handle_key(KeyAction::Mkdir);
+
+        // 한글 입력: "가나다"
+        app.handle_key(KeyAction::InputChar('가'));
+        app.handle_key(KeyAction::InputChar('나'));
+        app.handle_key(KeyAction::InputChar('다'));
+
+        if let AppMode::Input { buffer, cursor_pos, .. } = &app.mode {
+            assert_eq!(buffer, "가나다");
+            assert_eq!(*cursor_pos, 3); // char 단위
+        }
+
+        // Left 2번 → cursor_pos = 1 ("가|나다")
+        app.handle_key(KeyAction::InputCursorLeft);
+        app.handle_key(KeyAction::InputCursorLeft);
+        if let AppMode::Input { cursor_pos, .. } = &app.mode {
+            assert_eq!(*cursor_pos, 1);
+        }
+
+        // 중간에 'X' 삽입 → "가X나다"
+        app.handle_key(KeyAction::InputChar('X'));
+        if let AppMode::Input { buffer, cursor_pos, .. } = &app.mode {
+            assert_eq!(buffer, "가X나다");
+            assert_eq!(*cursor_pos, 2);
+        }
+
+        // Backspace → "가나다"
+        app.handle_key(KeyAction::InputBackspace);
+        if let AppMode::Input { buffer, cursor_pos, .. } = &app.mode {
+            assert_eq!(buffer, "가나다");
+            assert_eq!(*cursor_pos, 1);
+        }
+
+        // Delete → "가다"
+        app.handle_key(KeyAction::InputDelete);
+        if let AppMode::Input { buffer, cursor_pos, .. } = &app.mode {
+            assert_eq!(buffer, "가다");
+            assert_eq!(*cursor_pos, 1);
+        }
+
+        // End → cursor_pos = 2
+        app.handle_key(KeyAction::InputCursorEnd);
+        if let AppMode::Input { cursor_pos, .. } = &app.mode {
+            assert_eq!(*cursor_pos, 2);
+        }
+
+        // Home → cursor_pos = 0
+        app.handle_key(KeyAction::InputCursorHome);
+        if let AppMode::Input { cursor_pos, .. } = &app.mode {
+            assert_eq!(*cursor_pos, 0);
+        }
+    }
+
+    // --- 도움말 테스트 ---
+
+    #[test]
+    fn test_open_help_enters_help_mode() {
+        let (mut app, _) = create_test_app();
+        app.handle_key(KeyAction::Help);
+        match &app.mode {
+            AppMode::Help { scroll } => {
+                assert_eq!(*scroll, 0);
+            }
+            _ => panic!("Help 키로 Help 모드 진입 실패"),
+        }
+    }
+
+    #[test]
+    fn test_help_close_returns_normal() {
+        let (mut app, _) = create_test_app();
+        app.handle_key(KeyAction::Help);
+        assert!(matches!(app.mode, AppMode::Help { .. }));
+        app.handle_key(KeyAction::HelpClose);
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn test_help_scroll() {
+        let (mut app, _) = create_test_app();
+        app.terminal_height = 20;
+        app.handle_key(KeyAction::Help);
+
+        // 아래로 스크롤
+        app.handle_key(KeyAction::HelpDown);
+        if let AppMode::Help { scroll } = &app.mode {
+            assert_eq!(*scroll, 1);
+        } else {
+            panic!("Help 모드가 아님");
+        }
+
+        // 위로 스크롤
+        app.handle_key(KeyAction::HelpUp);
+        if let AppMode::Help { scroll } = &app.mode {
+            assert_eq!(*scroll, 0);
+        }
+
+        // Home: 처음으로
+        app.handle_key(KeyAction::HelpDown);
+        app.handle_key(KeyAction::HelpDown);
+        app.handle_key(KeyAction::HelpHome);
+        if let AppMode::Help { scroll } = &app.mode {
+            assert_eq!(*scroll, 0);
+        }
+    }
+
+    #[test]
+    fn test_generate_help_lines_not_empty() {
+        let lines = generate_help_lines();
+        assert!(!lines.is_empty());
+        // 주요 섹션이 포함되어야 한다
+        let joined = lines.join("\n");
+        assert!(joined.contains("네비게이션"));
+        assert!(joined.contains("CRUD"));
+        assert!(joined.contains("뷰어"));
+        assert!(joined.contains("검색"));
+        assert!(joined.contains("입력 모드"));
     }
 }
