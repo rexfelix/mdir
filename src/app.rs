@@ -10,6 +10,7 @@ pub enum InputPurpose {
     Move,
     Rename,
     Mkdir,
+    FileSearch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +25,21 @@ pub enum AppMode {
     Confirm {
         message: String,
     },
+    Viewer,
+    ViewerSearch {
+        buffer: String,
+        cursor_pos: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct ViewerState {
+    pub filename: String,
+    pub lines: Vec<String>,
+    pub scroll: usize,
+    pub search_query: Option<String>,
+    pub search_matches: Vec<usize>,
+    pub current_match: usize,
 }
 
 pub struct App {
@@ -40,6 +56,9 @@ pub struct App {
     pub error_message: Option<String>,
     pub mode: AppMode,
     pub selected_indices: HashSet<usize>,
+    pub viewer: Option<ViewerState>,
+    pub search_results: bool,
+    search_original_dir: Option<PathBuf>,
     previous_dir: Option<String>,
 }
 
@@ -59,6 +78,9 @@ impl App {
             error_message: None,
             mode: AppMode::Normal,
             selected_indices: HashSet::new(),
+            viewer: None,
+            search_results: false,
+            search_original_dir: None,
             previous_dir: None,
         };
         app.load_directory();
@@ -107,6 +129,8 @@ impl App {
             AppMode::Normal => crate::event::InputMode::Normal,
             AppMode::Input { .. } => crate::event::InputMode::Input,
             AppMode::Confirm { .. } => crate::event::InputMode::Confirm,
+            AppMode::Viewer => crate::event::InputMode::Viewer,
+            AppMode::ViewerSearch { .. } => crate::event::InputMode::ViewerSearch,
         }
     }
 
@@ -115,6 +139,8 @@ impl App {
             AppMode::Normal => self.handle_normal_key(action),
             AppMode::Input { .. } => self.handle_input_key(action),
             AppMode::Confirm { .. } => self.handle_confirm_key(action),
+            AppMode::Viewer => self.handle_viewer_key(action),
+            AppMode::ViewerSearch { .. } => self.handle_viewer_search_key(action),
         }
     }
 
@@ -130,7 +156,13 @@ impl App {
             KeyAction::PageUp => self.page_up(),
             KeyAction::PageDown => self.page_down(),
             KeyAction::Enter => self.enter(),
-            KeyAction::Backspace => self.go_parent(),
+            KeyAction::Backspace => {
+                if self.search_results {
+                    self.exit_search_results();
+                } else {
+                    self.go_parent();
+                }
+            }
             KeyAction::ToggleHidden => self.toggle_hidden(),
             KeyAction::Select => self.toggle_select(),
             KeyAction::Copy => self.start_copy(),
@@ -138,6 +170,8 @@ impl App {
             KeyAction::Delete => self.start_delete(),
             KeyAction::Rename => self.start_rename(),
             KeyAction::Mkdir => self.start_mkdir(),
+            KeyAction::View => self.open_viewer(),
+            KeyAction::FileSearch => self.start_file_search(),
             KeyAction::Quit => self.should_quit = true,
             KeyAction::Noop => {}
             // 입력/확인 모드 키는 Normal에서 무시
@@ -263,6 +297,11 @@ impl App {
     }
 
     fn enter(&mut self) {
+        // 검색 결과 모드에서 Enter → 해당 파일 위치로 이동
+        if self.search_results {
+            self.enter_search_result();
+            return;
+        }
         if let Some(entry) = self.entries.get(self.cursor) {
             if entry.is_dir() || entry.is_parent {
                 let target = entry.path.clone();
@@ -463,11 +502,19 @@ impl App {
     fn execute_input(&mut self) {
         let mode = self.mode.clone();
         if let AppMode::Input { purpose, buffer, .. } = mode {
+            if purpose == InputPurpose::FileSearch {
+                self.mode = AppMode::Normal;
+                if let Err(e) = self.exec_file_search(&buffer) {
+                    self.error_message = Some(e);
+                }
+                return;
+            }
             let result = match purpose {
                 InputPurpose::Copy => self.exec_copy(&buffer),
                 InputPurpose::Move => self.exec_move(&buffer),
                 InputPurpose::Rename => self.exec_rename(&buffer),
                 InputPurpose::Mkdir => self.exec_mkdir(&buffer),
+                InputPurpose::FileSearch => unreachable!(),
             };
             self.mode = AppMode::Normal;
             if let Err(e) = result {
@@ -518,6 +565,256 @@ impl App {
             }
         }
         self.mode = AppMode::Normal;
+    }
+
+    // --- 뷰어 ---
+
+    fn open_viewer(&mut self) {
+        if let Some(entry) = self.entries.get(self.cursor) {
+            if entry.is_dir() || entry.is_parent {
+                return;
+            }
+
+            // 10MB 제한
+            if entry.size > 10 * 1024 * 1024 {
+                self.error_message = Some("파일이 너무 큽니다 (10MB 초과)".to_string());
+                return;
+            }
+
+            match std::fs::read(&entry.path) {
+                Ok(bytes) => {
+                    // 바이너리 감지: 첫 512바이트에서 \x00 확인
+                    let check_len = bytes.len().min(512);
+                    if bytes[..check_len].contains(&0) {
+                        self.error_message =
+                            Some("바이너리 파일은 열 수 없습니다".to_string());
+                        return;
+                    }
+
+                    let content = String::from_utf8_lossy(&bytes);
+                    let lines: Vec<String> =
+                        content.lines().map(|l| l.to_string()).collect();
+
+                    self.viewer = Some(ViewerState {
+                        filename: entry.name.clone(),
+                        lines,
+                        scroll: 0,
+                        search_query: None,
+                        search_matches: Vec::new(),
+                        current_match: 0,
+                    });
+                    self.mode = AppMode::Viewer;
+                }
+                Err(e) => {
+                    self.error_message =
+                        Some(format!("파일 읽기 실패: {}", e));
+                }
+            }
+        }
+    }
+
+    fn close_viewer(&mut self) {
+        self.viewer = None;
+        self.mode = AppMode::Normal;
+    }
+
+    fn viewer_visible_lines(&self) -> usize {
+        self.terminal_height.saturating_sub(3) as usize
+    }
+
+    fn handle_viewer_key(&mut self, action: KeyAction) {
+        match action {
+            KeyAction::ViewerUp => {
+                if let Some(v) = &mut self.viewer {
+                    v.scroll = v.scroll.saturating_sub(1);
+                }
+            }
+            KeyAction::ViewerDown => {
+                let visible = self.viewer_visible_lines();
+                if let Some(v) = &mut self.viewer {
+                    if v.scroll + visible < v.lines.len() {
+                        v.scroll += 1;
+                    }
+                }
+            }
+            KeyAction::ViewerPageUp => {
+                let visible = self.viewer_visible_lines();
+                if let Some(v) = &mut self.viewer {
+                    v.scroll = v.scroll.saturating_sub(visible);
+                }
+            }
+            KeyAction::ViewerPageDown => {
+                let visible = self.viewer_visible_lines();
+                if let Some(v) = &mut self.viewer {
+                    let max_scroll = v.lines.len().saturating_sub(visible);
+                    v.scroll = (v.scroll + visible).min(max_scroll);
+                }
+            }
+            KeyAction::ViewerHome => {
+                if let Some(v) = &mut self.viewer {
+                    v.scroll = 0;
+                }
+            }
+            KeyAction::ViewerEnd => {
+                let visible = self.viewer_visible_lines();
+                if let Some(v) = &mut self.viewer {
+                    v.scroll = v.lines.len().saturating_sub(visible);
+                }
+            }
+            KeyAction::ViewerSearch => {
+                self.mode = AppMode::ViewerSearch {
+                    buffer: String::new(),
+                    cursor_pos: 0,
+                };
+            }
+            KeyAction::ViewerNextMatch => {
+                if let Some(v) = &mut self.viewer {
+                    if !v.search_matches.is_empty() {
+                        v.current_match =
+                            (v.current_match + 1) % v.search_matches.len();
+                        v.scroll = v.search_matches[v.current_match];
+                    }
+                }
+            }
+            KeyAction::ViewerPrevMatch => {
+                if let Some(v) = &mut self.viewer {
+                    if !v.search_matches.is_empty() {
+                        if v.current_match == 0 {
+                            v.current_match = v.search_matches.len() - 1;
+                        } else {
+                            v.current_match -= 1;
+                        }
+                        v.scroll = v.search_matches[v.current_match];
+                    }
+                }
+            }
+            KeyAction::ViewerClose => self.close_viewer(),
+            _ => {}
+        }
+    }
+
+    fn handle_viewer_search_key(&mut self, action: KeyAction) {
+        match action {
+            KeyAction::ViewerSearchChar(c) => {
+                if let AppMode::ViewerSearch { buffer, cursor_pos } = &mut self.mode {
+                    buffer.insert(*cursor_pos, c);
+                    *cursor_pos += 1;
+                }
+            }
+            KeyAction::ViewerSearchBackspace => {
+                if let AppMode::ViewerSearch { buffer, cursor_pos } = &mut self.mode {
+                    if *cursor_pos > 0 {
+                        buffer.remove(*cursor_pos - 1);
+                        *cursor_pos -= 1;
+                    }
+                }
+            }
+            KeyAction::ViewerSearchConfirm => {
+                let query = if let AppMode::ViewerSearch { buffer, .. } = &self.mode {
+                    buffer.clone()
+                } else {
+                    String::new()
+                };
+                self.execute_viewer_search(&query);
+                self.mode = AppMode::Viewer;
+            }
+            KeyAction::ViewerSearchCancel => {
+                self.mode = AppMode::Viewer;
+            }
+            _ => {}
+        }
+    }
+
+    fn execute_viewer_search(&mut self, query: &str) {
+        if let Some(v) = &mut self.viewer {
+            if query.is_empty() {
+                v.search_query = None;
+                v.search_matches.clear();
+                v.current_match = 0;
+                return;
+            }
+
+            let lower_query = query.to_lowercase();
+            let matches: Vec<usize> = v
+                .lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| line.to_lowercase().contains(&lower_query))
+                .map(|(i, _)| i)
+                .collect();
+
+            v.search_query = Some(query.to_string());
+            v.search_matches = matches;
+            v.current_match = 0;
+
+            // 첫 매치로 스크롤
+            if let Some(&first) = v.search_matches.first() {
+                v.scroll = first;
+            }
+        }
+    }
+
+    // --- 파일 검색 ---
+
+    fn start_file_search(&mut self) {
+        self.mode = AppMode::Input {
+            purpose: InputPurpose::FileSearch,
+            buffer: String::new(),
+            prompt: "검색 패턴:".to_string(),
+            cursor_pos: 0,
+        };
+    }
+
+    fn exec_file_search(&mut self, pattern: &str) -> Result<(), String> {
+        if pattern.is_empty() {
+            return Err("검색어를 입력해주세요".to_string());
+        }
+
+        let results = search_files_recursive(&self.current_dir, pattern, 1000);
+
+        if results.is_empty() {
+            return Err(format!("'{}' 검색 결과가 없습니다", pattern));
+        }
+
+        self.search_original_dir = Some(self.current_dir.clone());
+        self.search_results = true;
+        self.entries = results;
+        self.cursor = 0;
+        self.selected_indices.clear();
+        Ok(())
+    }
+
+    pub fn exit_search_results(&mut self) {
+        if self.search_results {
+            if let Some(orig) = self.search_original_dir.take() {
+                self.current_dir = orig;
+            }
+            self.search_results = false;
+            self.selected_indices.clear();
+            self.load_directory();
+        }
+    }
+
+    pub fn enter_search_result(&mut self) {
+        if !self.search_results {
+            return;
+        }
+        if let Some(entry) = self.entries.get(self.cursor) {
+            if let Some(parent) = entry.path.parent() {
+                let target_name = entry.name.clone();
+                self.current_dir = parent.to_path_buf();
+                self.search_results = false;
+                self.search_original_dir = None;
+                self.selected_indices.clear();
+                self.load_directory();
+                // 해당 파일에 커서 위치
+                self.cursor = self
+                    .entries
+                    .iter()
+                    .position(|e| e.name == target_name)
+                    .unwrap_or(0);
+            }
+        }
     }
 
     // --- 유틸 ---
@@ -582,6 +879,105 @@ fn disk_usage_for_path(path: &std::path::Path) -> Option<(u64, u64, u8)> {
 #[cfg(not(unix))]
 fn disk_usage_for_path(_path: &std::path::Path) -> Option<(u64, u64, u8)> {
     None
+}
+
+/// 재귀적으로 파일을 검색한다. 패턴은 대소문자 무시 + 간단한 glob (* 와일드카드).
+fn search_files_recursive(
+    dir: &std::path::Path,
+    pattern: &str,
+    max_results: usize,
+) -> Vec<FileEntry> {
+    let mut results = Vec::new();
+    search_files_inner(dir, pattern, max_results, &mut results);
+    file_entry::sort_entries(&mut results);
+    results
+}
+
+fn search_files_inner(
+    dir: &std::path::Path,
+    pattern: &str,
+    max_results: usize,
+    results: &mut Vec<FileEntry>,
+) {
+    if results.len() >= max_results {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        if results.len() >= max_results {
+            return;
+        }
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        // 숨김 파일 건너뜀
+        if name.starts_with('.') {
+            continue;
+        }
+
+        if glob_match(pattern, &name) {
+            if let Ok(fe) = FileEntry::from_path(&path) {
+                results.push(fe);
+            }
+        }
+
+        if path.is_dir() {
+            search_files_inner(&path, pattern, max_results, results);
+        }
+    }
+}
+
+/// 간단한 glob 매칭: * = 임의 문자열, ? = 임의 한 문자, 대소문자 무시.
+/// 패턴에 와일드카드가 없으면 contains 매칭.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    let lower_pattern = pattern.to_lowercase();
+    let lower_name = name.to_lowercase();
+
+    if !lower_pattern.contains('*') && !lower_pattern.contains('?') {
+        return lower_name.contains(&lower_pattern);
+    }
+
+    glob_match_inner(lower_pattern.as_bytes(), lower_name.as_bytes())
+}
+
+fn glob_match_inner(pattern: &[u8], name: &[u8]) -> bool {
+    let mut pi = 0;
+    let mut ni = 0;
+    let mut star_pi = usize::MAX;
+    let mut star_ni = 0;
+
+    while ni < name.len() {
+        if pi < pattern.len() && pattern[pi] == b'?' {
+            pi += 1;
+            ni += 1;
+        } else if pi < pattern.len() && pattern[pi] == b'*' {
+            star_pi = pi;
+            star_ni = ni;
+            pi += 1;
+        } else if pi < pattern.len() && pattern[pi] == name[ni] {
+            pi += 1;
+            ni += 1;
+        } else if star_pi != usize::MAX {
+            pi = star_pi + 1;
+            star_ni += 1;
+            ni = star_ni;
+        } else {
+            return false;
+        }
+    }
+
+    while pi < pattern.len() && pattern[pi] == b'*' {
+        pi += 1;
+    }
+
+    pi == pattern.len()
 }
 
 pub fn calculate_columns(width: u16) -> usize {
@@ -1242,5 +1638,245 @@ mod tests {
         assert!(total > 0);
         assert!(used <= total);
         assert!(percent <= 100);
+    }
+
+    // --- Phase 4 테스트 ---
+
+    #[test]
+    fn test_viewer_open_text_file() {
+        let (mut app, _dir) = create_test_app();
+        // file_a.txt 에 커서 (index 3)
+        app.cursor = 3;
+        app.handle_key(KeyAction::View);
+        assert_eq!(app.mode, AppMode::Viewer);
+        assert!(app.viewer.is_some());
+        let v = app.viewer.as_ref().unwrap();
+        assert_eq!(v.filename, "file_a.txt");
+        assert_eq!(v.lines.len(), 1); // "aaa"
+        assert_eq!(v.scroll, 0);
+    }
+
+    #[test]
+    fn test_viewer_open_directory_ignored() {
+        let (mut app, _dir) = create_test_app();
+        app.cursor = 1; // alpha_dir
+        app.handle_key(KeyAction::View);
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(app.viewer.is_none());
+    }
+
+    #[test]
+    fn test_viewer_close() {
+        let (mut app, _dir) = create_test_app();
+        app.cursor = 3;
+        app.handle_key(KeyAction::View);
+        assert_eq!(app.mode, AppMode::Viewer);
+
+        app.handle_key(KeyAction::ViewerClose);
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(app.viewer.is_none());
+    }
+
+    #[test]
+    fn test_viewer_scroll() {
+        let (mut app, dir) = create_test_app();
+        // 여러 줄 파일 생성
+        let content: String = (0..100).map(|i| format!("line {}\n", i)).collect();
+        fs::write(dir.path().join("long.txt"), &content).unwrap();
+        app.load_directory();
+
+        // long.txt 찾기
+        let idx = app.entries.iter().position(|e| e.name == "long.txt").unwrap();
+        app.cursor = idx;
+        app.update_layout(80, 24); // visible = 24 - 3 = 21 lines
+        app.handle_key(KeyAction::View);
+
+        let v = app.viewer.as_ref().unwrap();
+        assert_eq!(v.scroll, 0);
+        assert_eq!(v.lines.len(), 100);
+
+        // 아래로 스크롤
+        app.handle_key(KeyAction::ViewerDown);
+        assert_eq!(app.viewer.as_ref().unwrap().scroll, 1);
+
+        // 위로 스크롤
+        app.handle_key(KeyAction::ViewerUp);
+        assert_eq!(app.viewer.as_ref().unwrap().scroll, 0);
+
+        // 위 경계: 0에서 더 올라가지 않음
+        app.handle_key(KeyAction::ViewerUp);
+        assert_eq!(app.viewer.as_ref().unwrap().scroll, 0);
+
+        // End로 끝으로
+        app.handle_key(KeyAction::ViewerEnd);
+        let v = app.viewer.as_ref().unwrap();
+        assert!(v.scroll > 0);
+        assert!(v.scroll + 21 >= v.lines.len());
+
+        // Home으로 처음으로
+        app.handle_key(KeyAction::ViewerHome);
+        assert_eq!(app.viewer.as_ref().unwrap().scroll, 0);
+    }
+
+    #[test]
+    fn test_viewer_search() {
+        let (mut app, dir) = create_test_app();
+        let content = "apple\nbanana\ncherry\napricot\nblueberry\n";
+        fs::write(dir.path().join("fruits.txt"), content).unwrap();
+        app.load_directory();
+
+        let idx = app.entries.iter().position(|e| e.name == "fruits.txt").unwrap();
+        app.cursor = idx;
+        app.update_layout(80, 24);
+        app.handle_key(KeyAction::View);
+
+        // / 키로 검색 모드 진입
+        app.handle_key(KeyAction::ViewerSearch);
+        assert!(matches!(app.mode, AppMode::ViewerSearch { .. }));
+
+        // "ap" 입력
+        app.handle_key(KeyAction::ViewerSearchChar('a'));
+        app.handle_key(KeyAction::ViewerSearchChar('p'));
+        app.handle_key(KeyAction::ViewerSearchConfirm);
+
+        assert_eq!(app.mode, AppMode::Viewer);
+        let v = app.viewer.as_ref().unwrap();
+        assert_eq!(v.search_query, Some("ap".to_string()));
+        assert_eq!(v.search_matches.len(), 2); // apple, apricot
+        assert_eq!(v.search_matches[0], 0);    // line 0: apple
+        assert_eq!(v.search_matches[1], 3);    // line 3: apricot
+
+        // n으로 다음 매치
+        app.handle_key(KeyAction::ViewerNextMatch);
+        let v = app.viewer.as_ref().unwrap();
+        assert_eq!(v.current_match, 1);
+        assert_eq!(v.scroll, 3);
+
+        // N으로 이전 매치
+        app.handle_key(KeyAction::ViewerPrevMatch);
+        let v = app.viewer.as_ref().unwrap();
+        assert_eq!(v.current_match, 0);
+        assert_eq!(v.scroll, 0);
+    }
+
+    #[test]
+    fn test_viewer_search_cancel() {
+        let (mut app, _dir) = create_test_app();
+        app.cursor = 3;
+        app.handle_key(KeyAction::View);
+        app.handle_key(KeyAction::ViewerSearch);
+        assert!(matches!(app.mode, AppMode::ViewerSearch { .. }));
+
+        app.handle_key(KeyAction::ViewerSearchCancel);
+        assert_eq!(app.mode, AppMode::Viewer);
+    }
+
+    #[test]
+    fn test_viewer_binary_file_rejected() {
+        let (mut app, dir) = create_test_app();
+        // 바이너리 파일 생성 (null 바이트 포함)
+        let mut binary_data = vec![0x89, 0x50, 0x4E, 0x47, 0x00, 0x00];
+        binary_data.extend_from_slice(&[0x42; 100]);
+        fs::write(dir.path().join("image.png"), &binary_data).unwrap();
+        app.load_directory();
+
+        let idx = app.entries.iter().position(|e| e.name == "image.png").unwrap();
+        app.cursor = idx;
+        app.handle_key(KeyAction::View);
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(app.viewer.is_none());
+        assert!(app.error_message.is_some());
+        assert!(app.error_message.as_ref().unwrap().contains("바이너리"));
+    }
+
+    #[test]
+    fn test_file_search() {
+        let (mut app, dir) = create_test_app();
+        // 하위 디렉토리에 파일 생성
+        fs::write(dir.path().join("alpha_dir").join("nested.txt"), "nested").unwrap();
+
+        app.handle_key(KeyAction::FileSearch);
+        match &app.mode {
+            AppMode::Input { purpose, .. } => {
+                assert_eq!(*purpose, InputPurpose::FileSearch);
+            }
+            _ => panic!("FileSearch 키로 Input 모드 진입 실패"),
+        }
+
+        // "txt" 검색
+        for c in "txt".chars() {
+            app.handle_key(KeyAction::InputChar(c));
+        }
+        app.handle_key(KeyAction::InputConfirm);
+
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(app.search_results);
+        // file_a.txt, file_b.txt, nested.txt
+        assert!(app.entries.len() >= 3);
+        assert!(app.entries.iter().any(|e| e.name == "nested.txt"));
+    }
+
+    #[test]
+    fn test_file_search_exit() {
+        let (mut app, _dir) = create_test_app();
+        let original_dir = app.current_dir.clone();
+
+        app.handle_key(KeyAction::FileSearch);
+        for c in "file".chars() {
+            app.handle_key(KeyAction::InputChar(c));
+        }
+        app.handle_key(KeyAction::InputConfirm);
+        assert!(app.search_results);
+
+        // Backspace로 검색 결과 나가기
+        app.handle_key(KeyAction::Backspace);
+        assert!(!app.search_results);
+        assert_eq!(app.current_dir, original_dir);
+    }
+
+    #[test]
+    fn test_file_search_enter_result() {
+        let (mut app, dir) = create_test_app();
+        fs::write(dir.path().join("alpha_dir").join("target.txt"), "found").unwrap();
+
+        app.handle_key(KeyAction::FileSearch);
+        for c in "target".chars() {
+            app.handle_key(KeyAction::InputChar(c));
+        }
+        app.handle_key(KeyAction::InputConfirm);
+        assert!(app.search_results);
+
+        // Enter로 결과 위치로 이동
+        app.cursor = 0;
+        app.handle_key(KeyAction::Enter);
+        assert!(!app.search_results);
+        assert!(app.current_dir.ends_with("alpha_dir"));
+        assert_eq!(app.entries[app.cursor].name, "target.txt");
+    }
+
+    #[test]
+    fn test_file_search_no_results() {
+        let (mut app, _dir) = create_test_app();
+        app.handle_key(KeyAction::FileSearch);
+        for c in "nonexistent_xyz".chars() {
+            app.handle_key(KeyAction::InputChar(c));
+        }
+        app.handle_key(KeyAction::InputConfirm);
+        assert!(!app.search_results);
+        assert!(app.error_message.is_some());
+        assert!(app.error_message.as_ref().unwrap().contains("검색 결과가 없습니다"));
+    }
+
+    #[test]
+    fn test_glob_match() {
+        assert!(super::glob_match("*.txt", "readme.txt"));
+        assert!(super::glob_match("*.txt", "README.TXT"));
+        assert!(!super::glob_match("*.txt", "readme.rs"));
+        assert!(super::glob_match("test?", "test1"));
+        assert!(super::glob_match("test?", "testA"));
+        assert!(!super::glob_match("test?", "test12"));
+        assert!(super::glob_match("*", "anything"));
+        assert!(super::glob_match("file", "file_a.txt")); // contains match
+        assert!(super::glob_match("FILE", "file_a.txt")); // case insensitive
     }
 }

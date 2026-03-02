@@ -39,9 +39,28 @@ pub enum KeyAction {
     InputCursorRight,
     InputCursorHome,
     InputCursorEnd,
+    // Phase 4: 뷰어 및 검색
+    View,
+    FileSearch,
     // 확인 모드 전용
     ConfirmYes,
     ConfirmNo,
+    // 뷰어 모드 전용
+    ViewerUp,
+    ViewerDown,
+    ViewerPageUp,
+    ViewerPageDown,
+    ViewerHome,
+    ViewerEnd,
+    ViewerSearch,
+    ViewerNextMatch,
+    ViewerPrevMatch,
+    ViewerClose,
+    // 뷰어 검색 입력 전용
+    ViewerSearchChar(char),
+    ViewerSearchBackspace,
+    ViewerSearchConfirm,
+    ViewerSearchCancel,
     // 기타
     Quit,
     Noop,
@@ -53,6 +72,8 @@ pub enum InputMode {
     Normal,
     Input,
     Confirm,
+    Viewer,
+    ViewerSearch,
 }
 
 pub fn poll_event_with_mode(timeout: Duration, mode: InputMode) -> std::io::Result<AppEvent> {
@@ -63,6 +84,8 @@ pub fn poll_event_with_mode(timeout: Duration, mode: InputMode) -> std::io::Resu
                     InputMode::Normal => map_key_normal(key),
                     InputMode::Input => map_key_input(key),
                     InputMode::Confirm => map_key_confirm(key),
+                    InputMode::Viewer => map_key_viewer(key),
+                    InputMode::ViewerSearch => map_key_viewer_search(key),
                 };
                 Ok(AppEvent::Key(action))
             }
@@ -95,6 +118,8 @@ fn map_key_normal(key: KeyEvent) -> KeyAction {
         KeyCode::Char('d') | KeyCode::Char('D') => KeyAction::Delete,
         KeyCode::Char('r') | KeyCode::Char('R') => KeyAction::Rename,
         KeyCode::Char('k') | KeyCode::Char('K') => KeyAction::Mkdir,
+        KeyCode::Char('v') | KeyCode::Char('V') => KeyAction::View,
+        KeyCode::Char('f') | KeyCode::Char('F') => KeyAction::FileSearch,
         KeyCode::F(10) => KeyAction::Quit,
         _ => KeyAction::Noop,
     }
@@ -111,6 +136,32 @@ fn map_key_input(key: KeyEvent) -> KeyAction {
         KeyCode::Home => KeyAction::InputCursorHome,
         KeyCode::End => KeyAction::InputCursorEnd,
         KeyCode::Char(c) => KeyAction::InputChar(c),
+        _ => KeyAction::Noop,
+    }
+}
+
+fn map_key_viewer(key: KeyEvent) -> KeyAction {
+    match key.code {
+        KeyCode::Up => KeyAction::ViewerUp,
+        KeyCode::Down => KeyAction::ViewerDown,
+        KeyCode::PageUp => KeyAction::ViewerPageUp,
+        KeyCode::PageDown => KeyAction::ViewerPageDown,
+        KeyCode::Home => KeyAction::ViewerHome,
+        KeyCode::End => KeyAction::ViewerEnd,
+        KeyCode::Char('/') => KeyAction::ViewerSearch,
+        KeyCode::Char('n') => KeyAction::ViewerNextMatch,
+        KeyCode::Char('N') => KeyAction::ViewerPrevMatch,
+        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => KeyAction::ViewerClose,
+        _ => KeyAction::Noop,
+    }
+}
+
+fn map_key_viewer_search(key: KeyEvent) -> KeyAction {
+    match key.code {
+        KeyCode::Enter => KeyAction::ViewerSearchConfirm,
+        KeyCode::Esc => KeyAction::ViewerSearchCancel,
+        KeyCode::Backspace => KeyAction::ViewerSearchBackspace,
+        KeyCode::Char(c) => KeyAction::ViewerSearchChar(c),
         _ => KeyAction::Noop,
     }
 }
@@ -316,6 +367,88 @@ mod tests {
         assert_eq!(
             map_key_confirm(make_key(KeyCode::Esc, KeyModifiers::NONE)),
             KeyAction::ConfirmNo
+        );
+    }
+
+    // Phase 4 키 테스트
+
+    #[test]
+    fn test_view_and_search_keys() {
+        assert_eq!(
+            map_key_normal(make_key(KeyCode::Char('v'), KeyModifiers::NONE)),
+            KeyAction::View
+        );
+        assert_eq!(
+            map_key_normal(make_key(KeyCode::Char('f'), KeyModifiers::NONE)),
+            KeyAction::FileSearch
+        );
+    }
+
+    #[test]
+    fn test_viewer_mode_keys() {
+        assert_eq!(
+            map_key_viewer(make_key(KeyCode::Up, KeyModifiers::NONE)),
+            KeyAction::ViewerUp
+        );
+        assert_eq!(
+            map_key_viewer(make_key(KeyCode::Down, KeyModifiers::NONE)),
+            KeyAction::ViewerDown
+        );
+        assert_eq!(
+            map_key_viewer(make_key(KeyCode::PageUp, KeyModifiers::NONE)),
+            KeyAction::ViewerPageUp
+        );
+        assert_eq!(
+            map_key_viewer(make_key(KeyCode::PageDown, KeyModifiers::NONE)),
+            KeyAction::ViewerPageDown
+        );
+        assert_eq!(
+            map_key_viewer(make_key(KeyCode::Home, KeyModifiers::NONE)),
+            KeyAction::ViewerHome
+        );
+        assert_eq!(
+            map_key_viewer(make_key(KeyCode::End, KeyModifiers::NONE)),
+            KeyAction::ViewerEnd
+        );
+        assert_eq!(
+            map_key_viewer(make_key(KeyCode::Char('/'), KeyModifiers::NONE)),
+            KeyAction::ViewerSearch
+        );
+        assert_eq!(
+            map_key_viewer(make_key(KeyCode::Char('n'), KeyModifiers::NONE)),
+            KeyAction::ViewerNextMatch
+        );
+        assert_eq!(
+            map_key_viewer(make_key(KeyCode::Char('N'), KeyModifiers::SHIFT)),
+            KeyAction::ViewerPrevMatch
+        );
+        assert_eq!(
+            map_key_viewer(make_key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            KeyAction::ViewerClose
+        );
+        assert_eq!(
+            map_key_viewer(make_key(KeyCode::Esc, KeyModifiers::NONE)),
+            KeyAction::ViewerClose
+        );
+    }
+
+    #[test]
+    fn test_viewer_search_mode_keys() {
+        assert_eq!(
+            map_key_viewer_search(make_key(KeyCode::Char('a'), KeyModifiers::NONE)),
+            KeyAction::ViewerSearchChar('a')
+        );
+        assert_eq!(
+            map_key_viewer_search(make_key(KeyCode::Backspace, KeyModifiers::NONE)),
+            KeyAction::ViewerSearchBackspace
+        );
+        assert_eq!(
+            map_key_viewer_search(make_key(KeyCode::Enter, KeyModifiers::NONE)),
+            KeyAction::ViewerSearchConfirm
+        );
+        assert_eq!(
+            map_key_viewer_search(make_key(KeyCode::Esc, KeyModifiers::NONE)),
+            KeyAction::ViewerSearchCancel
         );
     }
 

@@ -15,6 +15,12 @@ pub fn render(frame: &mut Frame, app: &App) {
         return;
     }
 
+    // 뷰어 모드는 전체 화면 사용
+    if app.mode == AppMode::Viewer || matches!(app.mode, AppMode::ViewerSearch { .. }) {
+        render_viewer(frame, app, size);
+        return;
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -35,14 +41,20 @@ pub fn render(frame: &mut Frame, app: &App) {
         AppMode::Confirm { message } => {
             render_confirm_bar(frame, message, chunks[2]);
         }
+        _ => {}
     }
 }
 
 fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
     let inner_height = area.height.saturating_sub(2) as usize;
+    let title = if app.search_results {
+        format!(" 검색 결과: {}개 ", app.entries.len())
+    } else {
+        truncate_path(&app.current_dir.to_string_lossy(), area.width as usize - 2)
+    };
     if inner_height == 0 || app.entries.is_empty() {
         let block = Block::default()
-            .title(truncate_path(&app.current_dir.to_string_lossy(), area.width as usize - 2))
+            .title(title)
             .borders(Borders::ALL);
         frame.render_widget(block, area);
         return;
@@ -54,7 +66,7 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
         .collect();
 
     let block = Block::default()
-        .title(truncate_path(&app.current_dir.to_string_lossy(), area.width as usize - 2))
+        .title(title)
         .borders(Borders::ALL);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -134,6 +146,8 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 fn render_info_bar(frame: &mut Frame, app: &App, area: Rect) {
     let text = if let Some(err) = &app.error_message {
         format!(" ⚠ {}", err)
+    } else if app.search_results {
+        " Enter:이동 │ Backspace:검색종료 │ Q:종료".to_string()
     } else {
         let disk = match app.disk_usage() {
             Some((used, total, percent)) => {
@@ -142,7 +156,7 @@ fn render_info_bar(frame: &mut Frame, app: &App, area: Rect) {
             None => String::new(),
         };
         format!(
-            " Dir:{} File:{}{} │ C M D R K Q",
+            " Dir:{} File:{}{} │ V F C M D R K Q",
             app.dir_count(),
             app.file_count(),
             disk
@@ -197,6 +211,119 @@ fn entry_color(entry: &crate::file_entry::FileEntry) -> Style {
         Style::default().fg(Color::Green)
     } else {
         Style::default().fg(Color::White)
+    }
+}
+
+fn render_viewer(frame: &mut Frame, app: &App, area: Rect) {
+    let viewer = match &app.viewer {
+        Some(v) => v,
+        None => return,
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    // 파일 내용 영역
+    let title = format!(" {} ({} lines) ", viewer.filename, viewer.lines.len());
+    let block = Block::default().title(title).borders(Borders::ALL);
+    let inner = block.inner(chunks[0]);
+    frame.render_widget(block, chunks[0]);
+
+    let visible_height = inner.height as usize;
+    let mut lines: Vec<Line> = Vec::new();
+
+    for i in 0..visible_height {
+        let line_idx = viewer.scroll + i;
+        if line_idx >= viewer.lines.len() {
+            lines.push(Line::from("~"));
+            continue;
+        }
+
+        let line_text = &viewer.lines[line_idx];
+        let is_match = viewer.search_matches.contains(&line_idx);
+        let is_current_match = !viewer.search_matches.is_empty()
+            && viewer.current_match < viewer.search_matches.len()
+            && viewer.search_matches[viewer.current_match] == line_idx;
+
+        let line_num = format!("{:>4} ", line_idx + 1);
+
+        if is_current_match {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    line_num,
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    line_text.to_string(),
+                    Style::default().bg(Color::Yellow).fg(Color::Black),
+                ),
+            ]));
+        } else if is_match {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    line_num,
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    line_text.to_string(),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    line_num,
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(line_text.to_string(), Style::default().fg(Color::White)),
+            ]));
+        }
+    }
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, inner);
+
+    // 하단바: 뷰어 정보 또는 검색 입력
+    match &app.mode {
+        AppMode::ViewerSearch { buffer, cursor_pos } => {
+            render_input_bar(frame, "/", buffer, *cursor_pos, chunks[1]);
+        }
+        _ => {
+            let search_info = if let Some(q) = &viewer.search_query {
+                if viewer.search_matches.is_empty() {
+                    format!(" │ '{}' 매치 없음", q)
+                } else {
+                    format!(
+                        " │ '{}' {}/{}",
+                        q,
+                        viewer.current_match + 1,
+                        viewer.search_matches.len()
+                    )
+                }
+            } else {
+                String::new()
+            };
+            let percent = if viewer.lines.is_empty() {
+                0
+            } else {
+                (viewer.scroll * 100) / viewer.lines.len().max(1)
+            };
+            let text = format!(
+                " L{}/{} ({}%){} │ ↑↓ PgUp/Dn / n/N Q",
+                viewer.scroll + 1,
+                viewer.lines.len(),
+                percent,
+                search_info
+            );
+            let bar = Paragraph::new(Line::from(text))
+                .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+            frame.render_widget(bar, chunks[1]);
+        }
     }
 }
 
