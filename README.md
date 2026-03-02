@@ -188,13 +188,6 @@ F 키를 누르면 검색 패턴을 입력할 수 있습니다. 현재 디렉토
 - **[Ratatui](https://github.com/ratatui/ratatui)** - TUI 프레임워크
 - **[Crossterm](https://github.com/crossterm-rs/crossterm)** - 크로스 플랫폼 터미널 라이브러리
 
-## 개발 로드맵
-
-- [x] **Phase 1 (MVP)** - 파일 목록, 방향키 이동, 디렉토리 탐색, 상태바
-- [x] **Phase 2** - CRUD 단축키 (Copy, Move, Delete, Rename, Mkdir)
-- [x] **Phase 3** - 파일 타입별 색상, 하단 정보창 고도화
-- [x] **Phase 4** - 내부 뷰어 (V), 파일 검색 (F)
-
 ## 테스트
 
 ```bash
